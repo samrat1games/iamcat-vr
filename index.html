@@ -2,7 +2,8 @@
 <html lang="ru">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <title>I am Cat VR</title>
 <link rel="manifest" href="manifest.webmanifest">
 <meta name="theme-color" content="#2a1a10">
@@ -11,7 +12,7 @@
 <link rel="apple-touch-icon" href="icon-192.png">
 <style>
   html, body { margin: 0; height: 100%; overflow: hidden; background: #000; color: #fff; font: 16px system-ui, sans-serif; }
-  canvas { display: block; touch-action: none; }
+  canvas { display: block; touch-action: none; position: fixed; left: 0; top: 0; width: 100vw; height: 100vh; height: 100dvh; }
   #start { position: fixed; inset: 0; z-index: 5; overflow: hidden; background: #2a1a10; }
   #start .bg { position: absolute; inset: -6%; background: url(assets/logo.png) center / cover; filter: blur(26px) brightness(.8); }
   #start img { position: absolute; left: 50%; top: 0; height: calc(100% - 150px); max-width: 100%; transform: translateX(-50%); object-fit: contain; }
@@ -29,14 +30,14 @@
 </style>
 </head>
 <body>
-<div id="start">
+<div id="start" style="display:none">
   <div class="bg"></div><img src="assets/logo.png" alt="I am Cat">
   <div class="btns">
     <button id="goVr" style="background:#9ad1ff">📱 Cardboard — телефон + гироскоп</button>
   </div>
 </div>
 <div id="rot"><i>📱</i>Поверни телефон горизонтально<br><small style="font-size:14px;opacity:.7">вставь его в Cardboard</small></div>
-<div id="status"></div><div id="help"></div><div id="cross"></div>
+<div id="status"></div><div id="cross"></div>
 <video id="cam" playsinline muted></video>
 
 <script type="importmap">
@@ -136,8 +137,10 @@ function applyGyro() {
   _e.set(d(gyro.beta), d(gyro.alpha) + gyro.yawOffset, -d(gyro.gamma), 'YXZ');
   head.quaternion.setFromEuler(_e).multiply(_q1).multiply(_q.setFromAxisAngle(_z, -orient));
 }
+let gyroHooked = false;
 async function initGyro() {
   if (DeviceOrientationEvent.requestPermission && await DeviceOrientationEvent.requestPermission() !== 'granted') throw new Error('гироскоп запрещён');
+  if (gyroHooked) return; gyroHooked = true;
   addEventListener('deviceorientation', e => {
     if (e.alpha == null) return;
     if (!gyro.active) { gyro.active = true; gyro.yawOffset = -THREE.MathUtils.degToRad(e.alpha); }
@@ -191,34 +194,33 @@ let handsPromise = null, camState = 'ожидание', camBusy = false;
 function startCam() {                                    // камера после гироскопа: iOS показывает окна разрешений по одному
   if (camBusy || camState === 'ok') return handsPromise;
   camBusy = true; camState = 'запрос…';
-  return handsPromise = initHands().then(() => { camState = 'ok'; }, e => { camState = (e.message || e) + ' — тапни экран, чтобы повторить'; }).finally(() => { camBusy = false; });
+  return handsPromise = initHands().then(() => { camState = 'ok'; }, e => { camState = (e.message || e) + ' — тапни экран, чтобы повторить'; status('камера: ' + camState); }).finally(() => { camBusy = false; });
 }
-addEventListener('pointerdown', () => { if (MODE === 'vr' && camState !== 'ok' && !camBusy && !params.has('test')) startCam(); });
+let gyroBusy = false;
+function sensors() {                                     // гироскоп первым, потом камера: iOS показывает окна разрешений по одному
+  const g = gyro.active || gyroBusy ? Promise.resolve() : (gyroBusy = true, initGyro().catch(e => console.warn('гироскоп:', e.message || e)).finally(() => { gyroBusy = false; }));
+  if (!params.has('test')) g.finally(() => startCam());
+}
+addEventListener('pointerdown', () => { if (MODE === 'vr' && (!gyro.active || camState !== 'ok')) sensors(); });
 let warns = '';
 function enter(mode) {
   MODE = mode; PHASE = 'load'; $('start').remove();
   head.position.set(0, 0, 0); head.quaternion.identity();
   renderer.setAnimationLoop(() => { if (PHASE === 'load') loadTick(); else tick(); });
-  if (mode === 'pc') { $('help').textContent = 'Тяни мышью — осмотреться'; }
-  else {
-    $('help').textContent = 'Поворачивай телефон — можно осмотреться';
-    const warn = t => { console.warn(t); warns += ' ⚠ ' + t; $('help').textContent += ' ⚠ ' + t; status(t); };
-    const gyroP = initGyro().catch(e => warn('гироскоп: ' + (e.message || e)));          // requestPermission — первым делом, в жесте тапа
-    if (!params.has('test')) gyroP.finally(() => startCam());
-    Promise.resolve().then(() => document.documentElement.requestFullscreen?.()).catch(() => {});
-    screen.orientation?.lock?.('landscape').catch(() => {}); navigator.wakeLock?.request('screen').catch(() => {});
-    setTimeout(() => { if (!gyro.active) warn('гироскоп не отвечает — разреши «Движение и ориентация» в настройках браузера'); }, 8000);
-  }
+  const warn = t => { console.warn(t); status(t); };
+  sensors();                                                       // Android — сразу; iOS требует тап (см. pointerdown)
+  Promise.resolve().then(() => document.documentElement.requestFullscreen?.()).catch(() => {});
+  screen.orientation?.lock?.('landscape').catch(() => {}); navigator.wakeLock?.request('screen').catch(() => {});
+  setInterval(() => { if (!gyro.active) status('Тапни экран — включить гироскоп и камеру'); else if ($('status').textContent.startsWith('Тапни')) status(''); }, 600);
   enterResolve();
 }
-$('goVr').onclick = () => enter('vr');
 function loadTick() {
   if (PHASE !== 'load') return;
   updateLook();
   if (loadUI.bar) loadUI.bar.scale.x = Math.max(0.001, loadProgress);
   render(loadScene);
 }
-if (params.get('mode')) enter(params.get('mode'));
+enter('vr');
 
 /* ---------- Физика и модели: грузим пока человек смотрит на логотип ---------- */
 status('');
@@ -486,7 +488,7 @@ function moveHead(mx, mz) {                              // сдвиг с про
 }
 /* Как в Gorilla Tag: лапа упёрлась в пол/мебель — тело едет в обратную сторону от её движения (обе лапы усредняются);
    оторвал лапу — летишь по инерции с гравитацией, толчок вниз = прыжок; на земле трение, в воздухе почти нет */
-const ARM = { gain: 2.2, maxSpeed: 4.5, maxJump: 3.2, gravity: 9.8, groundDrag: 4, airDrag: 0.3, touchR: 0.1, dead: 0.0015 };
+const ARM = { gain: 2.0, maxSpeed: 1.5, maxJump: 0, liftK: 0, gravity: 9.8, groundDrag: 7, airDrag: 0.3, touchR: 0.1, dead: 0.0015 };
 const armVel = new THREE.Vector3(), _aw = new THREE.Vector3(), _ad = new THREE.Vector3(), _as = new THREE.Vector3();
 let lift = 0, liftVel = 0, wasTouch = false;                 // высота над «нормальной» (стоячей) позой и вертикальная скорость
 function armLoco(dt) {
@@ -503,7 +505,7 @@ function armLoco(dt) {
   if (n) {
     _as.multiplyScalar(-ARM.gain / n);
     if (!moveHead(_as.x, _as.z)) _as.x = _as.z = 0;
-    lift = Math.max(0, lift + _as.y); liftVel = 0;
+    lift = Math.max(0, lift + _as.y * ARM.liftK); liftVel = 0;
     armVel.lerp(_as.divideScalar(dt), 0.5);
   } else {
     if (wasTouch) { armVel.clampLength(0, ARM.maxSpeed); liftVel = THREE.MathUtils.clamp(armVel.y, 0, ARM.maxJump); }   // отрыв: запоминаем разгон
@@ -537,7 +539,8 @@ let handLandmarker = null, lastVideoTime = -1;
 async function initHands() {
   if (!navigator.mediaDevices?.getUserMedia) throw new Error('нет доступа к камере (нужен HTTPS)');
   const streamP = navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' }, width: 640, height: 480 }, audio: false });   // сразу, пока жив тап
-  const [{ HandLandmarker, FilesetResolver }, stream] = await Promise.all([import('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs'), streamP]);
+  const stream = await streamP; camState = 'грузим библиотеку рук…';
+  const { HandLandmarker, FilesetResolver } = await import('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs');
   video.srcObject = stream; video.muted = true; video.setAttribute('playsinline', '');
   await video.play(); camState = 'грузим модель рук…';
   const fileset = await FilesetResolver.forVisionTasks('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm');
@@ -639,7 +642,6 @@ function stepPhysics(dt) {
 let HELP = '', lastHud = 0;
 function tick() {
   if (PHASE !== 'play') return;
-  if (performance.now() - lastHud > 400) { lastHud = performance.now(); $('help').textContent = HELP + ' · 📷 ' + camState + ' · рук: ' + hands.filter(h => h.active).length + warns; }
   const dt = THREE.MathUtils.clamp(clock.getDelta(), 1 / 240, 1 / 30);
   updateLook();
   walk(dt); updateHands(); updatePaw(); armLoco(dt); updateGranny(dt); stepPhysics(dt);
