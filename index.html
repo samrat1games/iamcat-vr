@@ -21,6 +21,10 @@
   #status { position: fixed; left: 50%; bottom: 14px; transform: translateX(-50%); font-size: 18px; z-index: 2; pointer-events: none; text-shadow: 0 1px 4px #000; }
   #help { position: fixed; left: 8px; bottom: 8px; font-size: 12px; opacity: .75; z-index: 2; pointer-events: none; text-shadow: 0 1px 3px #000; max-width: 45vw; }
   #cross { position: fixed; left: 50%; top: 50%; width: 8px; height: 8px; margin: -4px; border: 2px solid #fff8; border-radius: 50%; z-index: 2; pointer-events: none; display: none; }
+  #rot { position: fixed; inset: 0; z-index: 20; background: #2a1a10; color: #fff; display: none; flex-direction: column; align-items: center; justify-content: center; font-size: 22px; gap: 14px; text-align: center; }
+  #rot i { font-size: 64px; font-style: normal; display: inline-block; animation: rt 1.6s ease-in-out infinite; }
+  @keyframes rt { 0%, 30% { transform: rotate(0); } 70%, 100% { transform: rotate(90deg); } }
+  @media (orientation: portrait) { #rot { display: flex; } }
   #cam { position: fixed; left: 0; top: 0; width: 2px; height: 2px; opacity: 0; pointer-events: none; }
 </style>
 </head>
@@ -31,6 +35,7 @@
     <button id="goVr" style="background:#9ad1ff">📱 Cardboard — телефон + гироскоп</button>
   </div>
 </div>
+<div id="rot"><i>📱</i>Поверни телефон горизонтально<br><small style="font-size:14px;opacity:.7">вставь его в Cardboard</small></div>
 <div id="status"></div><div id="help"></div><div id="cross"></div>
 <video id="cam" playsinline muted></video>
 
@@ -327,7 +332,7 @@ function makeBabka() {
   const hd = U.head = new THREE.Group(); hd.position.copy(neck); sway.add(hd);
   const part = (name, color, extra, dy = 0, dz = 0) => { const m = glb(name, color, extra); m.position.set(0, dy, dz).sub(neck); hd.add(m); return m; };
   part('Babka_Head_Pc', 0xe0b9a0); part('BabkaHairs', 0xcccccc);
-  part('Babka_Glasses', 0x88aacc, { transparent: true, opacity: 0.45 }, 1.15, 0.13);
+  part('Babka_Glasses', 0x050505, { roughness: 0.3 }, 1.15, 0.13);
   U.arms = [new THREE.Group(), new THREE.Group()]; U.legs = [new THREE.Group(), new THREE.Group()];
   g.userData = U; return g;
 }
@@ -447,7 +452,7 @@ const hands = [1, -1].map(side => {
   const paw = makePaw(); paw.rotation.x = -0.15; if (side < 0) paw.scale.x = -1; head.add(paw);
   const body = world.createRigidBody(RAPIER.RigidBodyDesc.kinematicPositionBased());
   return { side, paw, body, col: world.createCollider(RAPIER.ColliderDesc.ball(0.07), body), target: new THREE.Vector3(side * 0.12, -0.04, -0.5),
-    active: false, pinching: false, w: new THREE.Vector3(), wprev: new THREE.Vector3(), pv: new THREE.Vector3(), prev: new THREE.Vector3(), init: false, touch: false, wInit: false };
+    active: false, pinching: false, q: new THREE.Quaternion(), restQ: new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), -0.15), w: new THREE.Vector3(), wprev: new THREE.Vector3(), pv: new THREE.Vector3(), prev: new THREE.Vector3(), init: false, touch: false, wInit: false };
 });
 let pawDepth = 0.5;
 const _vel = new THREE.Vector3(), holdOffset = new THREE.Vector3();
@@ -546,6 +551,18 @@ function landmarkToHead(lm, palmSize, out) {
   const halfH = Math.tan(THREE.MathUtils.degToRad(camL.fov / 2)) * depth, halfW = halfH * camL.aspect;
   return out.set((lm.x - 0.5) * 2 * halfW, -(lm.y - 0.5) * 2 * halfH, -depth);
 }
+/* Ориентация лапы по руке: пальцы (запястье→средний палец) = «вперёд» лапы, ладонь (запястье, основание указательного и мизинца) = «вниз» лапы */
+const _hf = new THREE.Vector3(), _ha = new THREE.Vector3(), _hb = new THREE.Vector3(), _hx = new THREE.Vector3(), _hy = new THREE.Vector3(), _hz = new THREE.Vector3(), _hm = new THREE.Matrix4();
+function handOrient(l, h) {
+  const depth = THREE.MathUtils.clamp(0.08 / Math.max(Math.hypot(l[0].x - l[9].x, l[0].y - l[9].y), 0.02), 0.25, 0.9);
+  const halfH = Math.tan(THREE.MathUtils.degToRad(camL.fov / 2)) * depth, sy = 2 * halfH, sx = sy * camL.aspect;
+  const v = (a, b) => new THREE.Vector3((l[b].x - l[a].x) * sx, -(l[b].y - l[a].y) * sy, -(l[b].z - l[a].z) * sx);   // z у MediaPipe — того же масштаба, что и x; ближе к камере = меньше
+  _hf.copy(v(0, 9)).normalize(); _ha.copy(v(0, 5)); _hb.copy(v(0, 17));
+  const n = _ha.cross(_hb).multiplyScalar(h.side).normalize();                      // нормаль из ладони (для левой руки знак обратный)
+  _hy.copy(n).negate().addScaledVector(_hf, n.dot(_hf)).normalize();                // «верх» лапы = тыльная сторона, ортогональный пальцам
+  _hz.copy(_hf).negate(); _hx.crossVectors(_hy, _hz);
+  h.targetQ = (h.targetQ || new THREE.Quaternion()).setFromRotationMatrix(_hm.makeBasis(_hx, _hy, _hz));
+}
 function updateHands() {
   if (!handLandmarker || video.currentTime === lastVideoTime) return;
   lastVideoTime = video.currentTime;
@@ -557,7 +574,8 @@ function updateHands() {
     h.active = true;
     const palm = Math.hypot(l[0].x - l[9].x, l[0].y - l[9].y), pinchDist = Math.hypot(l[4].x - l[8].x, l[4].y - l[8].y) / palm;
     h.pinching = h.wasPinch ? pinchDist < 0.6 : pinchDist < 0.35; h.wasPinch = h.pinching;
-    landmarkToHead(l[9], palm, h.target); h.target.x *= 1.4; h.target.y *= 1.6;   // лапа достаёт дальше руки — чтобы дотянуться до пола
+    landmarkToHead(l[9], palm, h.target); h.target.x *= 1.4; h.target.y *= 1.6;
+    handOrient(l, h);   // лапа достаёт дальше руки — чтобы дотянуться до пола
   });
   for (const h of hands) if (!h.active) h.wasPinch = false;
 }
@@ -565,6 +583,7 @@ function updatePaw() {
   for (const h of hands) {
     if (!h.active) h.target.set(h.side * 0.1, -0.12, -0.5);   // нет руки в кадре — лапа в позе покоя
     h.paw.position.lerp(h.target, 0.5);
+    h.paw.quaternion.slerp(h.active && h.targetQ ? h.targetQ : h.restQ, 0.35);
   }
 }
 
