@@ -81,15 +81,16 @@ head.add(camC, camL, camR);
 
 /* Линзы Cardboard: каждый глаз рисуем в текстуру и выводим через бочкообразную дисторсию (r' = r·(1 + k1·r² + k2·r⁴)), чтобы линзы шлема вернули прямые линии */
 const LENS = { k1: 0.22, k2: 0.24 };
-const lensRT = new THREE.WebGLRenderTarget(2, 2, { samples: 4 }); lensRT.texture.colorSpace = THREE.SRGBColorSpace;
+const IOS = /iP(hone|ad|od)/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+const lensRT = new THREE.WebGLRenderTarget(2, 2, { samples: IOS ? 0 : 4 }); lensRT.texture.colorSpace = THREE.SRGBColorSpace;
 const lensMat = new THREE.ShaderMaterial({
   uniforms: { t: { value: lensRT.texture }, k1: { value: LENS.k1 }, k2: { value: LENS.k2 } },
   vertexShader: 'varying vec2 vUv; void main(){ vUv = uv; gl_Position = vec4(position.xy, 0., 1.); }',
   fragmentShader: `uniform sampler2D t; uniform float k1, k2; varying vec2 vUv;
     void main(){
-      vec2 p = (vUv - .5) * 2.; float r2 = dot(p, p) * .5, s = 1. + .5 * k1 + .25 * k2;
+      vec2 e = vec2(fract(vUv.x * 2.), vUv.y); vec2 p = (e - .5) * 2.; float r2 = dot(p, p) * .5, s = 1. + .5 * k1 + .25 * k2;
       vec2 q = p * (1. + k1 * r2 + k2 * r2 * r2) / s;
-      gl_FragColor = (abs(q.x) > 1. || abs(q.y) > 1.) ? vec4(0., 0., 0., 1.) : texture2D(t, q * .5 + .5);
+      gl_FragColor = (abs(q.x) > 1. || abs(q.y) > 1.) ? vec4(0., 0., 0., 1.) : texture2D(t, vec2((q.x * .5 + .5 + (vUv.x < .5 ? 0. : 1.)) * .5, q.y * .5 + .5));
       #include <colorspace_fragment>
     }`, depthTest: false, depthWrite: false
 });
@@ -98,7 +99,7 @@ const lensScene = new THREE.Scene(), lensCam = new THREE.Camera(); lensScene.add
 
 function resize() {
   const w = innerWidth, h = innerHeight; renderer.setSize(w, h);
-  lensRT.setSize(Math.round(w / 2 * renderer.getPixelRatio()), Math.round(h * renderer.getPixelRatio()));
+  lensRT.setSize(Math.round(w * renderer.getPixelRatio()), Math.round(h * renderer.getPixelRatio()));
   camC.aspect = w / h; camL.aspect = camR.aspect = (w / 2) / h;
   camC.updateProjectionMatrix(); camL.updateProjectionMatrix(); camR.updateProjectionMatrix();
 }
@@ -108,11 +109,10 @@ function render(sc) {
   const w = innerWidth, h = innerHeight;
   head.updateMatrixWorld(true);
   if (MODE === 'vr') {                                          // Stereo split-screen: левый и правый глаз
-    for (const [cam, x0] of [[camL, 0], [camR, w / 2]]) {
-      renderer.setScissorTest(false); renderer.setRenderTarget(lensRT); renderer.render(sc, cam);
-      renderer.setRenderTarget(null); renderer.setScissorTest(true);
-      renderer.setViewport(x0, 0, w / 2, h); renderer.setScissor(x0, 0, w / 2, h); renderer.render(lensScene, lensCam);
-    }
+    const W = lensRT.width, H = lensRT.height, hw = W >> 1;
+    renderer.setRenderTarget(lensRT); lensRT.scissorTest = true;
+    for (const [cam, x0] of [[camL, 0], [camR, hw]]) { lensRT.viewport.set(x0, 0, hw, H); lensRT.scissor.set(x0, 0, hw, H); renderer.render(sc, cam); }
+    renderer.setRenderTarget(null); renderer.setScissorTest(false); renderer.setViewport(0, 0, w, h); renderer.render(lensScene, lensCam);
   } else { renderer.setScissorTest(false); renderer.setViewport(0, 0, w, h); renderer.render(sc, camC); }
 }
 
@@ -438,7 +438,8 @@ function makePaw() {
   const g = new THREE.Group(), fur = stdMat(0xf2a65a), pad = stdMat(0xd9808a);
   const model = glb('paw_R', 0xf2a65a);
   if (model) {                                          // модель смотрит лапой в −Z; кулак у начала координат, рука уходит к камере
-    const k = 0.55; model.scale.setScalar(k); model.rotation.y = Math.PI; model.position.set(-0.2135 * k, -0.057 * k, 0); g.add(model); return g;
+    const k = 0.55; model.scale.setScalar(k); model.rotation.y = Math.PI; model.position.set(-0.2135 * k, -0.057 * k, 0); g.add(model);
+    const cap = new THREE.Mesh(new THREE.SphereGeometry(0.045, 14, 10), stdMat(0xf2a65a)); cap.position.set(0, 0, 0.27); cap.scale.set(1, 1.05, 1.6); g.add(cap); return g;
   }
   const part = (geo, m, x, y, z) => { const o = new THREE.Mesh(geo, m); o.position.set(x, y, z); o.castShadow = true; g.add(o); return o; };
   part(new THREE.SphereGeometry(0.06, 16, 12), fur, 0, 0, 0).scale.set(1, 0.75, 1.25);
@@ -538,13 +539,13 @@ async function initHands() {
   const streamP = navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' }, width: 640, height: 480 }, audio: false });   // сразу, пока жив тап
   const [{ HandLandmarker, FilesetResolver }, stream] = await Promise.all([import('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs'), streamP]);
   video.srcObject = stream; video.muted = true; video.setAttribute('playsinline', '');
-  await video.play();
+  await video.play(); camState = 'грузим модель рук…';
   const fileset = await FilesetResolver.forVisionTasks('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm');
   const make = delegate => HandLandmarker.createFromOptions(fileset, {
     baseOptions: { modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task', delegate },
     runningMode: 'VIDEO', numHands: 2
   });
-  handLandmarker = await make('GPU').catch(() => make('CPU'));
+  handLandmarker = await Promise.race([make('GPU'), new Promise((_, r) => setTimeout(() => r(new Error('GPU таймаут')), 10000))]).catch(() => make('CPU'));
 }
 function landmarkToHead(lm, palmSize, out) {
   const depth = THREE.MathUtils.clamp(0.08 / Math.max(palmSize, 0.02), 0.25, 0.9);
