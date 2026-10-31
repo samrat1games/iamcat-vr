@@ -21,7 +21,7 @@
   #status { position: fixed; left: 50%; bottom: 14px; transform: translateX(-50%); font-size: 18px; z-index: 2; pointer-events: none; text-shadow: 0 1px 4px #000; }
   #help { position: fixed; left: 8px; bottom: 8px; font-size: 12px; opacity: .75; z-index: 2; pointer-events: none; text-shadow: 0 1px 3px #000; max-width: 45vw; }
   #cross { position: fixed; left: 50%; top: 50%; width: 8px; height: 8px; margin: -4px; border: 2px solid #fff8; border-radius: 50%; z-index: 2; pointer-events: none; display: none; }
-  #cam { display: none; }
+  #cam { position: fixed; left: 0; top: 0; width: 2px; height: 2px; opacity: 0; pointer-events: none; }
 </style>
 </head>
 <body>
@@ -183,6 +183,7 @@ const loadReady = buildLoadScene();
 /* ---------- Вход: кнопки, права на гироскоп/камеру (только по клику!) ---------- */
 let enterResolve; const entered = new Promise(r => { enterResolve = r; });
 let handsPromise = null;
+let warns = '';
 function enter(mode) {
   MODE = mode; PHASE = 'load'; $('start').remove();
   head.position.set(0, 0, 0); head.quaternion.identity();
@@ -190,11 +191,12 @@ function enter(mode) {
   if (mode === 'pc') { $('help').textContent = 'Тяни мышью — осмотреться'; }
   else {
     $('help').textContent = 'Поворачивай телефон — можно осмотреться';
-    (async () => {
-      try { await document.documentElement.requestFullscreen?.(); await screen.orientation?.lock?.('landscape').catch(() => {}); await navigator.wakeLock?.request('screen').catch(() => {}); } catch {}
-      try { await initGyro(); } catch (e) { status('гироскоп: ' + e.message + ' (нужен HTTPS)'); }
-    })();
-    if (!params.has('test')) handsPromise = (async () => { try { await initHands(); } catch (e) { status('камера/руки: ' + e.message); } })();
+    const warn = t => { console.warn(t); warns += ' ⚠ ' + t; $('help').textContent += ' ⚠ ' + t; status(t); };
+    const gyroP = initGyro().catch(e => warn('гироскоп: ' + (e.message || e)));          // requestPermission — первым делом, в жесте тапа
+    if (!params.has('test')) handsPromise = initHands().catch(e => warn('камера/руки: ' + (e.message || e)));
+    Promise.resolve().then(() => document.documentElement.requestFullscreen?.()).catch(() => {});
+    screen.orientation?.lock?.('landscape').catch(() => {}); navigator.wakeLock?.request('screen').catch(() => {});
+    setTimeout(() => { if (!gyro.active) warn('гироскоп не отвечает — разреши «Движение и ориентация» в настройках браузера'); }, 8000);
   }
   enterResolve();
 }
@@ -452,7 +454,6 @@ addEventListener('wheel', e => { pawDepth = THREE.MathUtils.clamp(pawDepth + e.d
 addEventListener('pointerdown', e => {
   if (PHASE !== 'play') return;
   if (MODE === 'pc') { if (document.pointerLockElement !== renderer.domElement) renderer.domElement.requestPointerLock?.()?.catch?.(() => {}); else if (e.button === 0) mouseDown = true; }
-  else if (MODE === 'vr') { autoWalk = !autoWalk; status(autoWalk ? 'иду вперёд (тап — стоп)' : 'стою (тап — идти)'); }
 });
 addEventListener('pointerup', e => { if (e.button === 0) mouseDown = false; });
 const _f = new THREE.Vector3(), _r = new THREE.Vector3();
@@ -522,14 +523,17 @@ function walk(dt) {
 const video = $('cam');
 let handLandmarker = null, lastVideoTime = -1;
 async function initHands() {
-  const { HandLandmarker, FilesetResolver } = await import('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs');
-  video.srcObject = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment', width: 640, height: 480 }, audio: false });
+  if (!navigator.mediaDevices?.getUserMedia) throw new Error('нет доступа к камере (нужен HTTPS)');
+  const streamP = navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' }, width: 640, height: 480 }, audio: false });   // сразу, пока жив тап
+  const [{ HandLandmarker, FilesetResolver }, stream] = await Promise.all([import('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs'), streamP]);
+  video.srcObject = stream; video.muted = true; video.setAttribute('playsinline', '');
   await video.play();
   const fileset = await FilesetResolver.forVisionTasks('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm');
-  handLandmarker = await HandLandmarker.createFromOptions(fileset, {
-    baseOptions: { modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task', delegate: 'GPU' },
+  const make = delegate => HandLandmarker.createFromOptions(fileset, {
+    baseOptions: { modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task', delegate },
     runningMode: 'VIDEO', numHands: 2
   });
+  handLandmarker = await make('GPU').catch(() => make('CPU'));
 }
 function landmarkToHead(lm, palmSize, out) {
   const depth = THREE.MathUtils.clamp(0.08 / Math.max(palmSize, 0.02), 0.25, 0.9);
@@ -632,7 +636,7 @@ if (MODE === 'pc') {
   $('cross').style.display = 'block';
   $('help').textContent = 'Клик — захват мыши · WASD — ходить · Shift — бежать · мышь/стрелки — смотреть · ЛКМ/пробел — взять · колесо — дальность лапы · R — заново';
 } else {
-  $('help').textContent = 'Две руки перед камерой · лапой на пол и оттолкнись — поедешь, как в Gorilla Tag · щипок — взять предмет';
+  $('help').textContent = 'Две руки перед камерой · лапой на пол и оттолкнись — поедешь, как в Gorilla Tag · щипок — взять предмет' + warns;
   renderer.shadowMap.enabled = true; scene.traverse(o => { if (o.material) o.material.needsUpdate = true; });
 }
 clock.getDelta();
