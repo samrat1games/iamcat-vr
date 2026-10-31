@@ -1,0 +1,642 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>I am Cat VR</title>
+<link rel="manifest" href="manifest.webmanifest">
+<meta name="theme-color" content="#2a1a10">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<link rel="apple-touch-icon" href="icon-192.png">
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #000; color: #fff; font: 16px system-ui, sans-serif; }
+  canvas { display: block; touch-action: none; }
+  #start { position: fixed; inset: 0; z-index: 5; overflow: hidden; background: #2a1a10; }
+  #start .bg { position: absolute; inset: -6%; background: url(assets/logo.png) center / cover; filter: blur(26px) brightness(.8); }
+  #start img { position: absolute; left: 50%; top: 0; height: calc(100% - 150px); max-width: 100%; transform: translateX(-50%); object-fit: contain; }
+  #start .btns { position: absolute; left: 0; right: 0; bottom: 0; padding: 14px 16px 18px; display: flex; gap: 14px; flex-wrap: wrap; justify-content: center; align-items: center; background: linear-gradient(transparent, #0008 40%); }
+  #start button { font-size: 20px; padding: 14px 24px; border-radius: 14px; border: 0; min-width: 280px; cursor: pointer; }
+  #start .note { flex-basis: 100%; text-align: center; opacity: .75; font-size: 12px; text-shadow: 0 1px 3px #000; }
+  #status { position: fixed; left: 50%; bottom: 14px; transform: translateX(-50%); font-size: 18px; z-index: 2; pointer-events: none; text-shadow: 0 1px 4px #000; }
+  #help { position: fixed; left: 8px; bottom: 8px; font-size: 12px; opacity: .75; z-index: 2; pointer-events: none; text-shadow: 0 1px 3px #000; max-width: 45vw; }
+  #cross { position: fixed; left: 50%; top: 50%; width: 8px; height: 8px; margin: -4px; border: 2px solid #fff8; border-radius: 50%; z-index: 2; pointer-events: none; display: none; }
+  #cam { display: none; }
+</style>
+</head>
+<body>
+<div id="start">
+  <div class="bg"></div><img src="assets/logo.png" alt="I am Cat">
+  <div class="btns">
+    <button id="goVr" style="background:#9ad1ff">📱 Cardboard — телефон + гироскоп</button>
+  </div>
+</div>
+<div id="status"></div><div id="help"></div><div id="cross"></div>
+<video id="cam" playsinline muted></video>
+
+<script type="importmap">
+{ "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js", "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/" } }
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+const $ = id => document.getElementById(id);
+const status = t => $('status').textContent = t;
+const params = new URLSearchParams(location.search);
+const tick0 = () => new Promise(r => setTimeout(r));   // отдать кадр браузеру между тяжёлыми шагами загрузки
+const EMB = window.EMBED || {};                          // файлы, вшитые в html (tools/embed.py); без них — грузим по сети из assets/
+const embBytes = url => { const b = EMB[url]; if (!b) return null; const s = atob(b), a = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) a[i] = s.charCodeAt(i); return a.buffer; };
+const assetUrl = url => EMB[url] ? 'data:' + (url.endsWith('.png') ? 'image/png' : 'application/octet-stream') + ';base64,' + EMB[url] : url;
+let MODE = null;                                       // 'pc' | 'vr'
+let PHASE = 'menu';                                    // 'menu' → 'load' (экран загрузки) → 'play'
+let loadProgress = 0;
+
+/* ---------- Renderer, камеры «головы» (общие для экрана загрузки и игры) ---------- */
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0xbfe3ff);
+scene.add(new THREE.HemisphereLight(0xffffff, 0xd9b48a, 1.6));
+const sun = new THREE.DirectionalLight(0xfff1d6, 1.4);
+sun.position.set(2.5, 5, 3); sun.castShadow = true; sun.shadow.mapSize.set(1024, 1024);
+Object.assign(sun.shadow.camera, { left: -5, right: 5, top: 5, bottom: -5, far: 16 });
+scene.add(sun, sun.target);
+
+const head = new THREE.Group(); scene.add(head);       // «тело» камеры: на нём гироскоп / мышь
+const IPD = 0.064;
+const camC = new THREE.PerspectiveCamera(75, 1, 0.05, 80);           // ПК: одна камера
+const camL = new THREE.PerspectiveCamera(80, 1, 0.05, 80), camR = camL.clone();   // Cardboard: две
+camL.position.x = -IPD / 2; camR.position.x = IPD / 2;
+head.add(camC, camL, camR);
+
+/* Линзы Cardboard: каждый глаз рисуем в текстуру и выводим через бочкообразную дисторсию (r' = r·(1 + k1·r² + k2·r⁴)), чтобы линзы шлема вернули прямые линии */
+const LENS = { k1: 0.22, k2: 0.24 };
+const lensRT = new THREE.WebGLRenderTarget(2, 2, { samples: 4 }); lensRT.texture.colorSpace = THREE.SRGBColorSpace;
+const lensMat = new THREE.ShaderMaterial({
+  uniforms: { t: { value: lensRT.texture }, k1: { value: LENS.k1 }, k2: { value: LENS.k2 } },
+  vertexShader: 'varying vec2 vUv; void main(){ vUv = uv; gl_Position = vec4(position.xy, 0., 1.); }',
+  fragmentShader: `uniform sampler2D t; uniform float k1, k2; varying vec2 vUv;
+    void main(){
+      vec2 p = (vUv - .5) * 2.; float r2 = dot(p, p) * .5, s = 1. + .5 * k1 + .25 * k2;
+      vec2 q = p * (1. + k1 * r2 + k2 * r2 * r2) / s;
+      gl_FragColor = (abs(q.x) > 1. || abs(q.y) > 1.) ? vec4(0., 0., 0., 1.) : texture2D(t, q * .5 + .5);
+      #include <colorspace_fragment>
+    }`, depthTest: false, depthWrite: false
+});
+const lensQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), lensMat); lensQuad.frustumCulled = false;
+const lensScene = new THREE.Scene(), lensCam = new THREE.Camera(); lensScene.add(lensQuad);
+
+function resize() {
+  const w = innerWidth, h = innerHeight; renderer.setSize(w, h);
+  lensRT.setSize(Math.round(w / 2 * renderer.getPixelRatio()), Math.round(h * renderer.getPixelRatio()));
+  camC.aspect = w / h; camL.aspect = camR.aspect = (w / 2) / h;
+  camC.updateProjectionMatrix(); camL.updateProjectionMatrix(); camR.updateProjectionMatrix();
+}
+addEventListener('resize', resize); resize();
+
+function render(sc) {
+  const w = innerWidth, h = innerHeight;
+  head.updateMatrixWorld(true);
+  if (MODE === 'vr') {                                          // Stereo split-screen: левый и правый глаз
+    for (const [cam, x0] of [[camL, 0], [camR, w / 2]]) {
+      renderer.setScissorTest(false); renderer.setRenderTarget(lensRT); renderer.render(sc, cam);
+      renderer.setRenderTarget(null); renderer.setScissorTest(true);
+      renderer.setViewport(x0, 0, w / 2, h); renderer.setScissor(x0, 0, w / 2, h); renderer.render(lensScene, lensCam);
+    }
+  } else { renderer.setScissorTest(false); renderer.setViewport(0, 0, w, h); renderer.render(sc, camC); }
+}
+
+/* ---------- Управление взглядом: мышь / стрелки / гироскоп (нужно и на экране загрузки) ---------- */
+let yaw = 0, pitch = 0, spaceHeld = false, mouseDown = false, autoWalk = false;
+const keys = new Set();
+const _e = new THREE.Euler(0, 0, 0, 'YXZ');
+addEventListener('keydown', e => { keys.add(e.code); if (e.code === 'Space') { spaceHeld = true; e.preventDefault(); } if (e.code === 'KeyR') location.reload(); });
+addEventListener('keyup', e => { keys.delete(e.code); if (e.code === 'Space') spaceHeld = false; });
+addEventListener('mousemove', e => {
+  if (MODE !== 'pc') return;
+  if (PHASE === 'play' && document.pointerLockElement !== renderer.domElement) return;
+  if (PHASE === 'load' && !(e.buttons & 1)) return;                // на экране загрузки крутим зажатой кнопкой
+  yaw -= e.movementX * 0.0022; pitch = THREE.MathUtils.clamp(pitch - e.movementY * 0.0022, -1.4, 1.4);
+});
+
+const gyro = { alpha: 0, beta: 0, gamma: 0, active: false, yawOffset: 0 };
+const _q = new THREE.Quaternion(), _q1 = new THREE.Quaternion(-Math.sqrt(0.5), 0, 0, Math.sqrt(0.5)), _z = new THREE.Vector3(0, 0, 1);
+function applyGyro() {
+  const d = THREE.MathUtils.degToRad, orient = d((screen.orientation && screen.orientation.angle) || window.orientation || 0);
+  _e.set(d(gyro.beta), d(gyro.alpha) + gyro.yawOffset, -d(gyro.gamma), 'YXZ');
+  head.quaternion.setFromEuler(_e).multiply(_q1).multiply(_q.setFromAxisAngle(_z, -orient));
+}
+async function initGyro() {
+  if (DeviceOrientationEvent.requestPermission && await DeviceOrientationEvent.requestPermission() !== 'granted') throw new Error('гироскоп запрещён');
+  addEventListener('deviceorientation', e => {
+    if (e.alpha == null) return;
+    if (!gyro.active) { gyro.active = true; gyro.yawOffset = -THREE.MathUtils.degToRad(e.alpha); }
+    gyro.alpha = e.alpha; gyro.beta = e.beta; gyro.gamma = e.gamma;
+  });
+}
+const updateLook = () => { if (MODE === 'pc') head.quaternion.setFromEuler(_e.set(pitch, yaw, 0, 'YXZ')); else if (gyro.active) applyGyro(); };
+
+/* ---------- Экран загрузки: логотип на весь экран + размытое «продолжение» вокруг, можно крутить головой ---------- */
+const loadScene = new THREE.Scene();
+const loadUI = { bar: null, logo: null };
+const logoImg = new Image(); logoImg.src = assetUrl('assets/logo.png');
+const logoReady = logoImg.decode().then(() => true, () => false);
+function blurred(src, w, h) {                           // размытая копия картинки (ctx.filter нет в Safari — там даунсэмпл + апсэмпл)
+  const c = Object.assign(document.createElement('canvas'), { width: w, height: h }), x = c.getContext('2d');
+  if ('filter' in x) { x.filter = `blur(${Math.round(w / 60)}px)`; x.drawImage(src, 0, 0, w, h); return c; }
+  let cur = src, k = 16;
+  while (k >= 1) { const s = Object.assign(document.createElement('canvas'), { width: Math.max(2, w / k | 0), height: Math.max(2, h / k | 0) }); s.getContext('2d').drawImage(cur, 0, 0, s.width, s.height); cur = s; k /= 2; }
+  x.imageSmoothingQuality = 'high'; x.drawImage(cur, 0, 0, w, h); return c;
+}
+async function buildLoadScene() {
+  if (!await logoReady) { loadScene.background = new THREE.Color(0x2a1a10); }
+  else {
+    const W = 2048, H = 1024, pano = Object.assign(document.createElement('canvas'), { width: W, height: H }), p = pano.getContext('2d');
+    const tile = Object.assign(document.createElement('canvas'), { width: 1024, height: 1024 });   // картинка на половину панорамы, зеркально — без швов
+    const tx = tile.getContext('2d'); tx.drawImage(logoImg, 0, 0, 1024, 1024);
+    const soft = blurred(tile, 1024, 1024);
+    p.drawImage(soft, 1024, 0);                                        // спереди (−Z): продолжение логотипа
+    p.save(); p.translate(1024, 0); p.scale(-1, 1); p.drawImage(soft, 0, 0); p.restore();   // сзади — отражение
+    const panoTex = new THREE.CanvasTexture(pano); panoTex.colorSpace = THREE.SRGBColorSpace;
+    loadScene.add(new THREE.Mesh(new THREE.SphereGeometry(30, 48, 24), new THREE.MeshBasicMaterial({ map: panoTex, side: THREE.BackSide })));
+    // резкий логотип с мягкими краями поверх размытого фона
+    const lc = Object.assign(document.createElement('canvas'), { width: 1024, height: 1024 }), lx = lc.getContext('2d');
+    lx.drawImage(logoImg, 0, 0, 1024, 1024);
+    const m = lx.createRadialGradient(512, 512, 330, 512, 512, 512); m.addColorStop(0, '#fff'); m.addColorStop(1, '#fff0');
+    lx.globalCompositeOperation = 'destination-in'; lx.fillStyle = m; lx.fillRect(0, 0, 1024, 1024);
+    const lt = new THREE.CanvasTexture(lc); lt.colorSpace = THREE.SRGBColorSpace;
+    const logo = loadUI.logo = new THREE.Mesh(new THREE.PlaneGeometry(3.2, 3.2), new THREE.MeshBasicMaterial({ map: lt, transparent: true }));
+    logo.position.set(0, 0.1, -3.2); loadScene.add(logo);
+  }
+  const barBg = new THREE.Mesh(new THREE.PlaneGeometry(2.2, 0.07), new THREE.MeshBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.45 }));
+  barBg.position.set(0, -1.75, -3.1); loadScene.add(barBg);
+  const bar = loadUI.bar = new THREE.Mesh(new THREE.PlaneGeometry(2.16, 0.045), new THREE.MeshBasicMaterial({ color: 0xffb347 }));
+  bar.geometry.translate(1.08, 0, 0); bar.position.set(-1.08, -1.75, -3.09); bar.scale.x = 0.001; loadScene.add(bar);
+}
+const loadReady = buildLoadScene();
+
+/* ---------- Вход: кнопки, права на гироскоп/камеру (только по клику!) ---------- */
+let enterResolve; const entered = new Promise(r => { enterResolve = r; });
+let handsPromise = null;
+function enter(mode) {
+  MODE = mode; PHASE = 'load'; $('start').remove();
+  head.position.set(0, 0, 0); head.quaternion.identity();
+  renderer.setAnimationLoop(() => { if (PHASE === 'load') loadTick(); else tick(); });
+  if (mode === 'pc') { $('help').textContent = 'Тяни мышью — осмотреться'; }
+  else {
+    $('help').textContent = 'Поворачивай телефон — можно осмотреться';
+    (async () => {
+      try { await document.documentElement.requestFullscreen?.(); await screen.orientation?.lock?.('landscape').catch(() => {}); await navigator.wakeLock?.request('screen').catch(() => {}); } catch {}
+      try { await initGyro(); } catch (e) { status('гироскоп: ' + e.message + ' (нужен HTTPS)'); }
+    })();
+    if (!params.has('test')) handsPromise = (async () => { try { await initHands(); } catch (e) { status('камера/руки: ' + e.message); } })();
+  }
+  enterResolve();
+}
+$('goVr').onclick = () => enter('vr');
+function loadTick() {
+  if (PHASE !== 'load') return;
+  updateLook();
+  if (loadUI.bar) loadUI.bar.scale.x = Math.max(0.001, loadProgress);
+  render(loadScene);
+}
+if (params.get('mode')) enter(params.get('mode'));
+
+/* ---------- Физика и модели: грузим пока человек смотрит на логотип ---------- */
+status('');
+const RAPIER = (await import('https://cdn.jsdelivr.net/npm/@dimforge/rapier3d-compat@0.12.0/rapier.es.js')).default;
+await RAPIER.init();
+const world = new RAPIER.World({ x: 0, y: -9.81, z: 0 });
+const dynamic = [], kinds = new Map(), home = new Map();
+const stdMat = (color, extra = {}) => new THREE.MeshStandardMaterial({ color, roughness: 0.8, ...extra });
+const gltfLoader = new GLTFLoader();
+const loadGLB = async (url, w) => {
+  const buf = embBytes(url);
+  if (buf) { await tick0(); return gltfLoader.parseAsync(buf, ''); }
+  return new Promise((res, rej) => gltfLoader.load(url, res, e => { if (e.total) loadProgress = Math.max(loadProgress, w[0] + w[1] * e.loaded / e.total); }, rej));
+};
+const stage = (n, text) => { status(text); loadProgress = Math.max(loadProgress, n); return tick0(); };
+await loadReady;
+
+function addBody(mesh, desc, pos, kind = 'item') {
+  const body = world.createRigidBody(RAPIER.RigidBodyDesc.dynamic().setTranslation(...pos).setLinearDamping(0.3).setAngularDamping(0.8));
+  world.createCollider(desc.setRestitution(0.25).setFriction(0.8).setDensity(300), body);
+  mesh.position.set(...pos); mesh.traverse(o => { if (o.isMesh) o.castShadow = true; }); scene.add(mesh);
+  body.sleep();                                          // стоят на местах, пока их не тронут (иначе пересечения с полками выталкивают их сквозь пол)
+  dynamic.push({ mesh, body }); kinds.set(body.handle, kind); home.set(body.handle, new THREE.Vector3(...pos));
+  return body;
+}
+
+/* ---------- Дом из Unity (assets/house/house.glb собран tools/build_house.py) ---------- */
+await stage(0.02, 'Загружаю дом…');
+const houseGltf = await loadGLB('assets/house/house.glb', [0.02, 0.5]);
+const house = houseGltf.scene; scene.add(house);
+house.traverse(o => { if (o.isMesh) { o.receiveShadow = true; if (o.material.map) o.material.map.anisotropy = 4; } });
+await stage(0.55, 'Строю стены и пол…');
+const staticHandles = new Set();
+{
+  house.updateMatrixWorld(true);
+  const v = [], idx = [], p = new THREE.Vector3();
+  house.traverse(m => {
+    if (!m.isMesh) return;
+    const g = m.geometry, pos = g.attributes.position, base = v.length / 3;
+    for (let i = 0; i < pos.count; i++) { p.fromBufferAttribute(pos, i).applyMatrix4(m.matrixWorld); v.push(p.x, p.y, p.z); }
+    if (g.index) for (const i of g.index.array) idx.push(base + i); else for (let i = 0; i < pos.count; i++) idx.push(base + i);
+  });
+  const col = world.createCollider(RAPIER.ColliderDesc.trimesh(new Float32Array(v), new Uint32Array(idx)).setFriction(0.8));
+  staticHandles.add(col.handle);
+}
+const isStatic = c => staticHandles.has(c.handle);
+const _q0 = { x: 0, y: 0, z: 0, w: 1 }, ray = new RAPIER.Ray({ x: 0, y: 0, z: 0 }, { x: 0, y: -1, z: 0 });
+const balls = new Map();
+const hitStatic = (x, y, z, r) => world.intersectionWithShape({ x, y, z }, _q0, balls.get(r) ?? balls.set(r, new RAPIER.Ball(r)).get(r), undefined, undefined, undefined, undefined, isStatic) !== null;
+function groundAt(x, z, fromY, up = false) {              // высота пола под (x, z); fromY — откуда смотрим вниз (чтобы не вставать на столы)
+  ray.origin.x = x; ray.origin.y = fromY; ray.origin.z = z; ray.dir.y = up ? 1 : -1;
+  const h = world.castRay(ray, up ? 9 : 4, true, undefined, undefined, undefined, undefined, isStatic);
+  if (!h) return null; const d = h.timeOfImpact ?? h.toi;
+  return fromY + (up ? d : -d);
+}
+
+/* ---------- Предметы: из того же дома (props.glb), у каждого свой динамический коллайдер ---------- */
+await stage(0.6, 'Расставляю предметы…');
+const propsGltf = await loadGLB('assets/house/props.glb', [0.6, 0.15]);
+const propMeta = (EMB['assets/house/house.json'] ? JSON.parse(atob(EMB['assets/house/house.json'])) : await (await fetch('assets/house/house.json')).json()).props;
+{
+  const byId = new Map();
+  propsGltf.scene.traverse(o => { if (!o.isMesh) return; const m = /^p(\d+)_/.exec(o.name) || (o.parent && /^p(\d+)_/.exec(o.parent.name)); if (m) { (byId.get(m[1]) ?? byId.set(m[1], []).get(m[1])).push(o); } });
+  const box = new THREE.Box3(), c = new THREE.Vector3(), sz = new THREE.Vector3(), pt = new THREE.Vector3();
+  for (const [id, meshes] of byId) {
+    box.makeEmpty(); meshes.forEach(m => { m.geometry.computeBoundingBox(); box.union(m.geometry.boundingBox); });
+    box.getCenter(c); box.getSize(sz);
+    if (Math.max(sz.x, sz.y, sz.z) < 0.01 || Math.max(sz.x, sz.y, sz.z) > 1.2) continue;
+    const pts = [];
+    for (const m of meshes) { const pos = m.geometry.attributes.position, step = Math.max(1, Math.floor(pos.count / 120)); for (let i = 0; i < pos.count; i += step) { pt.fromBufferAttribute(pos, i).sub(c); pts.push(pt.x, pt.y, pt.z); } }
+    const group = new THREE.Group();
+    meshes.forEach(m => { m.removeFromParent(); m.position.set(-c.x, -c.y, -c.z); group.add(m); });
+    const name = propMeta['p' + id] || '';
+    const kind = /^Cup_/.test(name) ? 'cup' : /^Vase/.test(name) ? 'vase' : /^Cat/.test(name) ? 'statue' : /^(Tomato|Potato|Carrot|Eggplant|Сucumber|Chili|Bread)/.test(name) ? 'fruit' : 'item';
+    const desc = RAPIER.ColliderDesc.convexHull(new Float32Array(pts)) ?? RAPIER.ColliderDesc.cuboid(sz.x / 2, sz.y / 2, sz.z / 2);
+    addBody(group, desc, [c.x, c.y + 0.003, c.z], kind);
+  }
+}
+
+/* ---------- Бабушка (модель Unity без скелета; запасной вариант — из примитивов) ---------- */
+await stage(0.78, 'Бабушка идёт…');
+const GLB = {};
+const MODEL_FILES = ['Babka_Body', 'Babka_Head_Pc', 'BabkaHairs', 'Babka_Glasses', 'paw_R'];
+await Promise.all(MODEL_FILES.map(n => loadGLB(`assets/models/${n}.glb`, [0, 0]).then(g => { GLB[n] = g.scene; }, e => console.warn('модель не загрузилась:', n, e.message || e))));
+function glb(name, color, extra) {                       // покрашенный клон модели; null, если файл не загрузился
+  const src = GLB[name]; if (!src) return null;
+  const g = src.clone(true), m = stdMat(color, { side: THREE.DoubleSide, ...extra });
+  g.traverse(o => { if (o.isMesh) { o.material = m; o.castShadow = o.receiveShadow = true; } });
+  return g;
+}
+function makeGranny() {
+  const g = new THREE.Group(), U = {};
+  const skin = stdMat(0xf0c0a0), red = stdMat(0xd9534f), pants = stdMat(0x6b4a4a), hair = stdMat(0xdcdce6), dark = stdMat(0x222222), white = stdMat(0xffffff);
+  const add = (geo, m, x, y, z, parent = g) => { const o = new THREE.Mesh(geo, m); o.position.set(x, y, z); o.castShadow = true; parent.add(o); return o; };
+  add(new THREE.CapsuleGeometry(0.17, 0.34, 6, 14), red, 0, 1.12, 0);
+  const hd = U.head = new THREE.Group(); hd.position.set(0, 1.62, 0); g.add(hd);
+  add(new THREE.SphereGeometry(0.14, 24, 18), skin, 0, 0, 0, hd);
+  add(new THREE.SphereGeometry(0.15, 24, 12, 0, Math.PI * 2, 0, Math.PI * 0.5), hair, 0, 0.02, -0.02, hd);
+  for (const s of [-1, 1]) { add(new THREE.SphereGeometry(0.03, 14, 12), white, s * 0.055, 0.025, 0.115, hd); add(new THREE.SphereGeometry(0.015, 10, 8), dark, s * 0.055, 0.025, 0.142, hd); }
+  U.arms = [-1, 1].map(s => { const p = new THREE.Group(); p.position.set(s * 0.23, 1.4, 0); g.add(p); add(new THREE.CylinderGeometry(0.045, 0.05, 0.45, 10), red, 0, -0.22, 0, p); return p; });
+  U.legs = [-1, 1].map(s => { const p = new THREE.Group(); p.position.set(s * 0.085, 0.85, 0); g.add(p); add(new THREE.CylinderGeometry(0.075, 0.06, 0.75, 10), pants, 0, -0.375, 0, p); return p; });
+  g.userData = U; return g;
+}
+// части лежат в общих координатах (ноги на y = 0, лицо в +z). Скелета нет — качаем тело целиком, голова на «шее» поворачивается.
+function makeBabka() {
+  const g = new THREE.Group(), U = {}, S = 1.65 / 1.47;                 // рост ≈ 1.65 м
+  const tex = new THREE.TextureLoader().load(assetUrl('assets/textures/BabkaBody_CLR.png')); tex.colorSpace = THREE.SRGBColorSpace;
+  const sway = U.body = new THREE.Group(); sway.scale.setScalar(S); sway.position.z = -0.04 * S; g.add(sway);
+  sway.add(glb('Babka_Body', 0xffffff, { map: tex }));
+  const neck = new THREE.Vector3(0, 1.03, 0.12);
+  const hd = U.head = new THREE.Group(); hd.position.copy(neck); sway.add(hd);
+  const part = (name, color, extra, dy = 0, dz = 0) => { const m = glb(name, color, extra); m.position.set(0, dy, dz).sub(neck); hd.add(m); return m; };
+  part('Babka_Head_Pc', 0xe0b9a0); part('BabkaHairs', 0xcccccc);
+  part('Babka_Glasses', 0x88aacc, { transparent: true, opacity: 0.45 }, 1.15, 0.13);
+  U.arms = [new THREE.Group(), new THREE.Group()]; U.legs = [new THREE.Group(), new THREE.Group()];
+  g.userData = U; return g;
+}
+const granny = (GLB.Babka_Body && GLB.Babka_Head_Pc && GLB.BabkaHairs && GLB.Babka_Glasses ? makeBabka : makeGranny)();
+scene.add(granny);
+const grannyBody = world.createRigidBody(RAPIER.RigidBodyDesc.kinematicPositionBased());
+world.createCollider(RAPIER.ColliderDesc.capsule(0.55, 0.2), grannyBody);
+
+/* ---------- Навигация бабушки: сетка проходимых клеток + A* (по реальной геометрии дома) ---------- */
+await stage(0.9, 'Ищу, где ходить…');
+world.step();                                             // без первого шага запросы к геометрии (лучи, шары) ещё ничего не видят
+const CELL = 0.25;
+const nav = { cells: new Map(), start: null };
+const ck = (i, j) => i * 100000 + j;
+function cellWalkable(i, j) {
+  const k = ck(i, j); if (nav.cells.has(k)) return nav.cells.get(k);
+  const x = i * CELL, z = j * CELL;
+  let ok = false;
+  const gy = groundAt(x, z, 0.5);
+  if (gy !== null && Math.abs(gy) < 0.12 && groundAt(x, z, 0.3, true) !== null
+      && !hitStatic(x, 0.4, z, 0.2) && !hitStatic(x, 0.95, z, 0.2) && !hitStatic(x, 1.5, z, 0.2)) ok = true;
+  nav.cells.set(k, ok); return ok;
+}
+function findFree(x, z) {                                // ближайшая проходимая клетка (спиралью)
+  const ci = Math.round(x / CELL), cj = Math.round(z / CELL);
+  for (let r = 0; r < 40; r++) for (let di = -r; di <= r; di++) for (let dj = -r; dj <= r; dj++) if (Math.max(Math.abs(di), Math.abs(dj)) === r && cellWalkable(ci + di, cj + dj)) return [ci + di, cj + dj];
+  return [ci, cj];
+}
+const GRANNY_START = [1.58, 1.9];
+const reach = [];                                         // клетки, достижимые от бабушки
+{
+  const s = findFree(...GRANNY_START); nav.start = s;
+  const seen = new Set([ck(...s)]), q = [s];
+  while (q.length && reach.length < 6000) {
+    const [i, j] = q.pop(); reach.push([i, j]);
+    for (const [di, dj] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) { const a = i + di, b = j + dj, k = ck(a, b); if (!seen.has(k) && cellWalkable(a, b)) { seen.add(k); q.push([a, b]); } }
+  }
+}
+function findPath(from, to) {                             // A* по 8 соседям, без срезания углов
+  const key = ck, open = [[0, from]], g = new Map([[key(...from), 0]]), prev = new Map(), closed = new Set();
+  const h = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]);
+  while (open.length) {
+    open.sort((a, b) => a[0] - b[0]); const [, cur] = open.shift(), ckey = key(...cur);
+    if (closed.has(ckey)) continue; closed.add(ckey);
+    if (cur[0] === to[0] && cur[1] === to[1]) { const path = [cur]; let k = ckey; while (prev.has(k)) { const p = prev.get(k); path.push(p); k = key(...p); } return path.reverse(); }
+    for (let di = -1; di <= 1; di++) for (let dj = -1; dj <= 1; dj++) {
+      if (!di && !dj) continue;
+      const n = [cur[0] + di, cur[1] + dj]; if (!cellWalkable(...n)) continue;
+      if (di && dj && (!cellWalkable(cur[0] + di, cur[1]) || !cellWalkable(cur[0], cur[1] + dj))) continue;
+      const ng = g.get(ckey) + Math.hypot(di, dj);
+      if (ng < (g.get(key(...n)) ?? Infinity)) { g.set(key(...n), ng); prev.set(key(...n), cur); open.push([ng + h(n, to), n]); }
+    }
+  }
+  return null;
+}
+granny.position.set(nav.start[0] * CELL, 0, nav.start[1] * CELL);
+grannyBody.setTranslation({ x: granny.position.x, y: 0.8, z: granny.position.z }, true);
+const gs = { path: [], pi: 0, pause: 1, t: 0, walking: false };
+function pickTarget() {
+  const cur = [Math.round(granny.position.x / CELL), Math.round(granny.position.z / CELL)];
+  for (let tries = 0; tries < 8; tries++) {
+    const t = reach[Math.floor(Math.random() * reach.length)];
+    if (Math.hypot(t[0] - cur[0], t[1] - cur[1]) * CELL < 3) continue;
+    const p = findPath(cur, t); if (p) { gs.path = p; gs.pi = 1; return; }
+  }
+}
+function updateGranny(dt) {
+  const U = granny.userData;
+  const catDist = Math.hypot(head.position.x - granny.position.x, head.position.z - granny.position.z);
+  gs.walking = false;
+  if (gs.pause > 0 || catDist < 0.8) gs.pause = Math.max(0, gs.pause - dt);
+  else {
+    if (gs.pi >= gs.path.length) { gs.pause = 2 + Math.random() * 2; pickTarget(); }
+    else {
+      const [tx, tz] = [gs.path[gs.pi][0] * CELL, gs.path[gs.pi][1] * CELL];
+      const dx = tx - granny.position.x, dz = tz - granny.position.z, dist = Math.hypot(dx, dz);
+      if (dist < 0.08) gs.pi++;
+      else {
+        const speed = 0.6 * dt;
+        granny.position.x += dx / dist * Math.min(speed, dist); granny.position.z += dz / dist * Math.min(speed, dist);
+        const target = Math.atan2(dx, dz); let da = target - granny.rotation.y; da = Math.atan2(Math.sin(da), Math.cos(da));
+        granny.rotation.y += da * Math.min(1, dt * 5);
+        gs.walking = true; gs.t += dt * 6;
+      }
+    }
+  }
+  const sw = gs.walking ? Math.sin(gs.t) : 0, k = 0.45;
+  U.legs[0].rotation.x = sw * k; U.legs[1].rotation.x = -sw * k;
+  U.arms[0].rotation.x = -sw * k * 0.8; U.arms[1].rotation.x = sw * k * 0.8;
+  if (!gs.walking && gs.pause > 0) U.arms[1].rotation.x = -2.2 + Math.sin(performance.now() / 150) * 0.3;   // машет рукой
+  let ha = Math.atan2(head.position.x - granny.position.x, head.position.z - granny.position.z) - granny.rotation.y;
+  ha = THREE.MathUtils.clamp(Math.atan2(Math.sin(ha), Math.cos(ha)), -0.9, 0.9);
+  U.head.rotation.y += (ha - U.head.rotation.y) * Math.min(1, dt * 4);
+  if (U.body) {                                               // модель без скелета: покачивание при ходьбе и «махание» на остановке
+    U.body.position.y = gs.walking ? Math.abs(Math.sin(gs.t)) * 0.02 : 0;
+    U.body.rotation.z = gs.walking ? Math.sin(gs.t) * 0.04 : gs.pause > 0 ? Math.sin(performance.now() / 150) * 0.03 : 0;
+  }
+  grannyBody.setNextKinematicTranslation({ x: granny.position.x, y: 0.8, z: granny.position.z });
+}
+
+/* ---------- Лапа ---------- */
+function makePaw() {
+  const g = new THREE.Group(), fur = stdMat(0xf2a65a), pad = stdMat(0xd9808a);
+  const model = glb('paw_R', 0xf2a65a);
+  if (model) {                                          // модель смотрит лапой в −Z; кулак у начала координат, рука уходит к камере
+    const k = 0.55; model.scale.setScalar(k); model.position.set(0.2135 * k, -0.057 * k, 0.43 * k); g.add(model); return g;
+  }
+  const part = (geo, m, x, y, z) => { const o = new THREE.Mesh(geo, m); o.position.set(x, y, z); o.castShadow = true; g.add(o); return o; };
+  part(new THREE.SphereGeometry(0.06, 16, 12), fur, 0, 0, 0).scale.set(1, 0.75, 1.25);
+  [-0.04, -0.013, 0.013, 0.04].forEach((x, i) => part(new THREE.SphereGeometry(0.022, 10, 8), fur, x, 0, -0.078 - (i % 3 === 1 ? 0.006 : 0)));
+  part(new THREE.SphereGeometry(0.03, 10, 8), pad, 0, -0.035, 0.005).scale.set(1, 0.4, 1);
+  part(new THREE.CylinderGeometry(0.026, 0.034, 0.4, 12), fur, 0.01, -0.01, 0.26).rotation.x = Math.PI / 2;
+  return g;
+}
+/* Две лапы (правая и левая): каждая следует за своей рукой в кадре камеры */
+const hands = [1, -1].map(side => {
+  const paw = makePaw(); paw.rotation.x = -0.15; if (side < 0) paw.scale.x = -1; head.add(paw);
+  const body = world.createRigidBody(RAPIER.RigidBodyDesc.kinematicPositionBased());
+  return { side, paw, body, col: world.createCollider(RAPIER.ColliderDesc.ball(0.07), body), target: new THREE.Vector3(side * 0.12, -0.04, -0.5),
+    active: false, pinching: false, w: new THREE.Vector3(), wprev: new THREE.Vector3(), pv: new THREE.Vector3(), prev: new THREE.Vector3(), init: false, touch: false, wInit: false };
+});
+let pawDepth = 0.5;
+const _vel = new THREE.Vector3(), holdOffset = new THREE.Vector3();
+let held = null, heldBy = null;
+
+/* ---------- Ходьба кота по реальной геометрии дома ---------- */
+const EYE = [0.5, 0.6, 0.7].includes(+params.get('eye')) ? +params.get('eye') : 0.6;   // высота глаз над полом: ?eye=0.5 / 0.6 / 0.7
+let floorY = 0;
+addEventListener('wheel', e => { pawDepth = THREE.MathUtils.clamp(pawDepth + e.deltaY * 0.0005, 0.3, 0.9); });
+addEventListener('pointerdown', e => {
+  if (PHASE !== 'play') return;
+  if (MODE === 'pc') { if (document.pointerLockElement !== renderer.domElement) renderer.domElement.requestPointerLock?.()?.catch?.(() => {}); else if (e.button === 0) mouseDown = true; }
+  else if (MODE === 'vr') { autoWalk = !autoWalk; status(autoWalk ? 'иду вперёд (тап — стоп)' : 'стою (тап — идти)'); }
+});
+addEventListener('pointerup', e => { if (e.button === 0) mouseDown = false; });
+const _f = new THREE.Vector3(), _r = new THREE.Vector3();
+function canStep(x, z) {                                 // можно ли встать в (x, z): есть пол не выше ступеньки, нет стен/мебели, нет бабушки
+  if (Math.hypot(x - granny.position.x, z - granny.position.z) < 0.5) return null;
+  const gy = groundAt(x, z, floorY + 0.4);
+  if (gy === null || gy - floorY > 0.3 || floorY - gy > 0.5) return null;
+  if (hitStatic(x, gy + 0.28, z, 0.14) || hitStatic(x, gy + 0.55, z, 0.12)) return null;
+  return gy;
+}
+let baseY = 0;
+function moveHead(mx, mz) {                              // сдвиг с проверкой стен и скольжением вдоль них
+  let gy;
+  if ((gy = canStep(head.position.x + mx, head.position.z + mz)) !== null) { head.position.x += mx; head.position.z += mz; floorY = gy; return true; }
+  if ((gy = canStep(head.position.x + mx, head.position.z)) !== null) { head.position.x += mx; floorY = gy; return true; }
+  if ((gy = canStep(head.position.x, head.position.z + mz)) !== null) { head.position.z += mz; floorY = gy; return true; }
+  return false;
+}
+/* Как в Gorilla Tag: лапа упёрлась в пол/мебель — тело едет в обратную сторону от её движения (обе лапы усредняются);
+   оторвал лапу — летишь по инерции с гравитацией, толчок вниз = прыжок; на земле трение, в воздухе почти нет */
+const ARM = { gain: 2.2, maxSpeed: 4.5, maxJump: 3.2, gravity: 9.8, groundDrag: 4, airDrag: 0.3, touchR: 0.1, dead: 0.0015 };
+const armVel = new THREE.Vector3(), _aw = new THREE.Vector3(), _ad = new THREE.Vector3(), _as = new THREE.Vector3();
+let lift = 0, liftVel = 0, wasTouch = false;                 // высота над «нормальной» (стоячей) позой и вертикальная скорость
+function armLoco(dt) {
+  let n = 0; _as.set(0, 0, 0);
+  for (const h of hands) {
+    if (!h.active) { h.init = false; h.touch = false; continue; }
+    _aw.copy(h.paw.position).applyQuaternion(head.quaternion).add(head.position);
+    if (!h.init) { h.prev.copy(h.paw.position); h.init = true; }
+    _ad.copy(h.paw.position).sub(h.prev).applyQuaternion(head.quaternion); h.prev.copy(h.paw.position);   // движение лапы относительно головы
+    if (_ad.length() < ARM.dead) _ad.set(0, 0, 0);
+    h.touch = heldBy !== h && (_aw.y - floorY < ARM.touchR || hitStatic(_aw.x, _aw.y, _aw.z, ARM.touchR));
+    if (h.touch) { _as.add(_ad); n++; }
+  }
+  if (n) {
+    _as.multiplyScalar(-ARM.gain / n);
+    if (!moveHead(_as.x, _as.z)) _as.x = _as.z = 0;
+    lift = Math.max(0, lift + _as.y); liftVel = 0;
+    armVel.lerp(_as.divideScalar(dt), 0.5);
+  } else {
+    if (wasTouch) { armVel.clampLength(0, ARM.maxSpeed); liftVel = THREE.MathUtils.clamp(armVel.y, 0, ARM.maxJump); }   // отрыв: запоминаем разгон
+    armVel.y = 0;
+    if (armVel.lengthSq() > 1e-4 && !moveHead(armVel.x * dt, armVel.z * dt)) armVel.multiplyScalar(0.3);
+    armVel.multiplyScalar(Math.max(0, 1 - (lift > 0 ? ARM.airDrag : ARM.groundDrag) * dt));
+    if (lift > 0 || liftVel > 0) { liftVel -= ARM.gravity * dt; lift += liftVel * dt; if (lift <= 0) { lift = 0; liftVel = 0; } }
+  }
+  wasTouch = n > 0;
+}
+function walk(dt) {
+  let fwd = 0, side = 0;
+  if (MODE === 'pc') {
+    fwd = (keys.has('KeyW') ? 1 : 0) - (keys.has('KeyS') ? 1 : 0); side = (keys.has('KeyD') ? 1 : 0) - (keys.has('KeyA') ? 1 : 0);
+    yaw += ((keys.has('ArrowLeft') ? 1 : 0) - (keys.has('ArrowRight') ? 1 : 0)) * 1.8 * dt;              // запасной поворот стрелками
+    pitch = THREE.MathUtils.clamp(pitch + ((keys.has('ArrowUp') ? 1 : 0) - (keys.has('ArrowDown') ? 1 : 0)) * 1.2 * dt, -1.4, 1.4);
+  } else if (autoWalk) fwd = 1;
+  if (fwd || side) {
+    _f.set(0, 0, -1).applyQuaternion(head.quaternion); _f.y = 0; _f.normalize();
+    _r.set(-_f.z, 0, _f.x);
+    const sp = (keys.has('ShiftLeft') ? 2.4 : 1.3) * dt;
+    const mx = (_f.x * fwd + _r.x * side) * sp, mz = (_f.z * fwd + _r.z * side) * sp;
+    moveHead(mx, mz);
+  }
+  baseY += (floorY + EYE - baseY) * Math.min(1, dt * 10); head.position.y = baseY + lift;
+}
+
+// MediaPipe Hands (Cardboard)
+const video = $('cam');
+let handLandmarker = null, lastVideoTime = -1;
+async function initHands() {
+  const { HandLandmarker, FilesetResolver } = await import('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs');
+  video.srcObject = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment', width: 640, height: 480 }, audio: false });
+  await video.play();
+  const fileset = await FilesetResolver.forVisionTasks('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm');
+  handLandmarker = await HandLandmarker.createFromOptions(fileset, {
+    baseOptions: { modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task', delegate: 'GPU' },
+    runningMode: 'VIDEO', numHands: 2
+  });
+}
+function landmarkToHead(lm, palmSize, out) {
+  const depth = THREE.MathUtils.clamp(0.08 / Math.max(palmSize, 0.02), 0.25, 0.9);
+  const halfH = Math.tan(THREE.MathUtils.degToRad(camL.fov / 2)) * depth, halfW = halfH * camL.aspect;
+  return out.set((lm.x - 0.5) * 2 * halfW, -(lm.y - 0.5) * 2 * halfH, -depth);
+}
+function updateHands() {
+  if (!handLandmarker || video.currentTime === lastVideoTime) return;
+  lastVideoTime = video.currentTime;
+  const res = handLandmarker.detectForVideo(video, performance.now());
+  for (const h of hands) h.active = h.pinching = false;
+  const list = res.landmarks.map(l => ({ l, x: l[9].x })).sort((a, b) => a.x - b.x);   // тыловая камера не зеркалит: слева в кадре — левая рука
+  list.forEach(({ l }, i) => {
+    const h = list.length === 2 ? hands[1 - i] : hands[l[9].x < 0.5 ? 1 : 0];
+    h.active = true;
+    const palm = Math.hypot(l[0].x - l[9].x, l[0].y - l[9].y), pinchDist = Math.hypot(l[4].x - l[8].x, l[4].y - l[8].y) / palm;
+    h.pinching = h.wasPinch ? pinchDist < 0.6 : pinchDist < 0.35; h.wasPinch = h.pinching;
+    landmarkToHead(l[9], palm, h.target); h.target.x *= 1.4; h.target.y *= 1.6;   // лапа достаёт дальше руки — чтобы дотянуться до пола
+  });
+  for (const h of hands) if (!h.active) h.wasPinch = false;
+}
+function updatePaw() {
+  for (const h of hands) {
+    if (!h.active) h.target.set(h.side * 0.1, -0.12, -0.5);   // нет руки в кадре — лапа в позе покоя
+    h.paw.position.lerp(h.target, 0.5);
+  }
+}
+
+/* ---------- Улетевшее за пределы дома возвращаем на место ---------- */
+function keepInBounds() {
+  for (const { body } of dynamic) {
+    if (body === held) continue;
+    const t = body.translation();
+    if (t.y < -2 || Math.abs(t.x) > 40 || Math.abs(t.z) > 40) {
+      body.setTranslation(home.get(body.handle), true); body.setLinvel({ x: 0, y: 0, z: 0 }, true); body.setAngvel({ x: 0, y: 0, z: 0 }, true);
+    }
+  }
+}
+
+/* ---------- Физика: шаг, лапа, захват ---------- */
+const clock = new THREE.Clock();
+function stepPhysics(dt) {
+  world.timestep = dt;
+  for (const h of hands) {
+    h.col.setEnabled(h !== heldBy);
+    h.paw.updateWorldMatrix(true, false);
+    h.wprev.copy(h.w); h.paw.getWorldPosition(h.w);
+    if (!h.wInit) { h.wprev.copy(h.w); h.wInit = true; }
+    h.pv.lerp(_vel.copy(h.w).sub(h.wprev).divideScalar(dt), 0.3);
+    h.body.setNextKinematicTranslation(h.w);
+  }
+  if (!held) {
+    for (const h of hands) {
+      if (!(h.active && h.pinching)) continue;
+      let best = 0.2;                                         // берём ближайший предмет в радиусе 0.2 м
+      for (const { body } of dynamic) { const t = body.translation(), d = Math.hypot(t.x - h.w.x, t.y - h.w.y, t.z - h.w.z); if (d < best) { best = d; held = body; heldBy = h; } }
+      if (held) {
+        const t = held.translation(); holdOffset.set(t.x - h.w.x, t.y - h.w.y, t.z - h.w.z);
+        held.setBodyType(RAPIER.RigidBodyType.KinematicPositionBased, true); status('держу предмет'); break;
+      }
+    }
+  } else if (!(heldBy.active && heldBy.pinching)) {           // отпустили: бросок со скоростью лапы
+    held.setBodyType(RAPIER.RigidBodyType.Dynamic, true); held.setCcdEnabled(true);
+    held.setLinvel(heldBy.pv.clampLength(0, 6), true);
+    held = heldBy = null; status('');
+  }
+  if (held) held.setNextKinematicTranslation({ x: heldBy.w.x + holdOffset.x, y: heldBy.w.y + holdOffset.y, z: heldBy.w.z + holdOffset.z });
+  world.step();
+  for (const { mesh, body } of dynamic) {
+    const t = body.translation(), r = body.rotation();
+    mesh.position.set(t.x, t.y, t.z); mesh.quaternion.set(r.x, r.y, r.z, r.w);
+  }
+  keepInBounds();
+}
+
+/* ---------- Главный цикл ---------- */
+function tick() {
+  if (PHASE !== 'play') return;
+  const dt = THREE.MathUtils.clamp(clock.getDelta(), 1 / 240, 1 / 30);
+  updateLook();
+  walk(dt); updateHands(); updatePaw(); armLoco(dt); updateGranny(dt); stepPhysics(dt);
+  sun.position.set(head.position.x + 2.5, head.position.y + 5, head.position.z + 3); sun.target.position.copy(head.position);
+  render(scene);
+}
+window.__tick = tick; window.__dbg = { head, granny, hands, armLoco, moveHead, get lift() { return lift; }, world, scene, house, nav, reach, gs, dynamic, setView: (y, p) => { yaw = y; pitch = p; }, walkable: cellWalkable, hitStatic, groundAt, pickTarget, updateGranny };
+
+/* ---------- Конец загрузки → игра ---------- */
+loadProgress = 1; status('');
+await entered;                                          // игрок мог ещё не выбрать режим — ждём
+await new Promise(r => setTimeout(r, params.has('test') ? 0 : 900));   // дать увидеть заполненную полоску
+{
+  let best = null, bd = 1e9;                            // старт кота: просторная клетка (рядом нет мебели) ближе всего к гостиной
+  for (const [i, j] of reach) { const d = Math.hypot(i * CELL - 4, j * CELL - 0.5); if (d < bd && Math.hypot(i * CELL - granny.position.x, j * CELL - granny.position.z) > 2.5 && !hitStatic(i * CELL, 0.55, j * CELL, 0.4)) { bd = d; best = [i, j]; } }
+  const [si, sj] = best || nav.start;
+  head.position.set(si * CELL, EYE, sj * CELL); baseY = EYE; floorY = 0; yaw = 0; pitch = 0; head.quaternion.identity();
+}
+PHASE = 'play';
+if (MODE === 'pc') {
+  renderer.shadowMap.enabled = true; scene.traverse(o => { if (o.material) o.material.needsUpdate = true; });
+  $('cross').style.display = 'block';
+  $('help').textContent = 'Клик — захват мыши · WASD — ходить · Shift — бежать · мышь/стрелки — смотреть · ЛКМ/пробел — взять · колесо — дальность лапы · R — заново';
+} else {
+  $('help').textContent = 'Две руки перед камерой · лапой на пол и оттолкнись — поедешь, как в Gorilla Tag · щипок — взять предмет';
+  renderer.shadowMap.enabled = true; scene.traverse(o => { if (o.material) o.material.needsUpdate = true; });
+}
+clock.getDelta();
+navigator.serviceWorker?.register('sw.js').catch(() => {});
+</script>
+</body>
+</html>
