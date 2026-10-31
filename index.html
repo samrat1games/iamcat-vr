@@ -182,7 +182,13 @@ const loadReady = buildLoadScene();
 
 /* ---------- Вход: кнопки, права на гироскоп/камеру (только по клику!) ---------- */
 let enterResolve; const entered = new Promise(r => { enterResolve = r; });
-let handsPromise = null;
+let handsPromise = null, camState = 'ожидание', camBusy = false;
+function startCam() {                                    // камера после гироскопа: iOS показывает окна разрешений по одному
+  if (camBusy || camState === 'ok') return handsPromise;
+  camBusy = true; camState = 'запрос…';
+  return handsPromise = initHands().then(() => { camState = 'ok'; }, e => { camState = (e.message || e) + ' — тапни экран, чтобы повторить'; }).finally(() => { camBusy = false; });
+}
+addEventListener('pointerdown', () => { if (MODE === 'vr' && camState !== 'ok' && !camBusy && !params.has('test')) startCam(); });
 let warns = '';
 function enter(mode) {
   MODE = mode; PHASE = 'load'; $('start').remove();
@@ -193,7 +199,7 @@ function enter(mode) {
     $('help').textContent = 'Поворачивай телефон — можно осмотреться';
     const warn = t => { console.warn(t); warns += ' ⚠ ' + t; $('help').textContent += ' ⚠ ' + t; status(t); };
     const gyroP = initGyro().catch(e => warn('гироскоп: ' + (e.message || e)));          // requestPermission — первым делом, в жесте тапа
-    if (!params.has('test')) handsPromise = initHands().catch(e => warn('камера/руки: ' + (e.message || e)));
+    if (!params.has('test')) gyroP.finally(() => startCam());
     Promise.resolve().then(() => document.documentElement.requestFullscreen?.()).catch(() => {});
     screen.orientation?.lock?.('landscape').catch(() => {}); navigator.wakeLock?.request('screen').catch(() => {});
     setTimeout(() => { if (!gyro.active) warn('гироскоп не отвечает — разреши «Движение и ориентация» в настройках браузера'); }, 8000);
@@ -427,7 +433,7 @@ function makePaw() {
   const g = new THREE.Group(), fur = stdMat(0xf2a65a), pad = stdMat(0xd9808a);
   const model = glb('paw_R', 0xf2a65a);
   if (model) {                                          // модель смотрит лапой в −Z; кулак у начала координат, рука уходит к камере
-    const k = 0.55; model.scale.setScalar(k); model.position.set(0.2135 * k, -0.057 * k, 0.43 * k); g.add(model); return g;
+    const k = 0.55; model.scale.setScalar(k); model.rotation.y = Math.PI; model.position.set(-0.2135 * k, -0.057 * k, 0); g.add(model); return g;
   }
   const part = (geo, m, x, y, z) => { const o = new THREE.Mesh(geo, m); o.position.set(x, y, z); o.castShadow = true; g.add(o); return o; };
   part(new THREE.SphereGeometry(0.06, 16, 12), fur, 0, 0, 0).scale.set(1, 0.75, 1.25);
@@ -543,7 +549,7 @@ function landmarkToHead(lm, palmSize, out) {
 function updateHands() {
   if (!handLandmarker || video.currentTime === lastVideoTime) return;
   lastVideoTime = video.currentTime;
-  const res = handLandmarker.detectForVideo(video, performance.now());
+  let res; try { res = handLandmarker.detectForVideo(video, performance.now()); } catch (e) { camState = 'сбой распознавания: ' + (e.message || e); handLandmarker = null; return; }
   for (const h of hands) h.active = h.pinching = false;
   const list = res.landmarks.map(l => ({ l, x: l[9].x })).sort((a, b) => a.x - b.x);   // тыловая камера не зеркалит: слева в кадре — левая рука
   list.forEach(({ l }, i) => {
@@ -610,8 +616,10 @@ function stepPhysics(dt) {
 }
 
 /* ---------- Главный цикл ---------- */
+let HELP = '', lastHud = 0;
 function tick() {
   if (PHASE !== 'play') return;
+  if (performance.now() - lastHud > 400) { lastHud = performance.now(); $('help').textContent = HELP + ' · 📷 ' + camState + ' · рук: ' + hands.filter(h => h.active).length + warns; }
   const dt = THREE.MathUtils.clamp(clock.getDelta(), 1 / 240, 1 / 30);
   updateLook();
   walk(dt); updateHands(); updatePaw(); armLoco(dt); updateGranny(dt); stepPhysics(dt);
@@ -636,7 +644,7 @@ if (MODE === 'pc') {
   $('cross').style.display = 'block';
   $('help').textContent = 'Клик — захват мыши · WASD — ходить · Shift — бежать · мышь/стрелки — смотреть · ЛКМ/пробел — взять · колесо — дальность лапы · R — заново';
 } else {
-  $('help').textContent = 'Две руки перед камерой · лапой на пол и оттолкнись — поедешь, как в Gorilla Tag · щипок — взять предмет' + warns;
+  HELP = 'Две руки перед камерой · лапой на пол и оттолкнись — поедешь, как в Gorilla Tag · щипок — взять предмет';
   renderer.shadowMap.enabled = true; scene.traverse(o => { if (o.material) o.material.needsUpdate = true; });
 }
 clock.getDelta();
