@@ -85,7 +85,7 @@ head.add(camC, camL, camR);
 /* Линзы Cardboard: каждый глаз рисуем в текстуру и выводим через бочкообразную дисторсию (r' = r·(1 + k1·r² + k2·r⁴)), чтобы линзы шлема вернули прямые линии */
 const LENS = { k1: 0.22, k2: 0.24 };
 const IOS = /iP(hone|ad|od)/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
-const lensRT = new THREE.WebGLRenderTarget(2, 2, { samples: IOS ? 0 : 4 }); lensRT.texture.colorSpace = THREE.SRGBColorSpace;
+const lensRT = new THREE.WebGLRenderTarget(2, 2, { samples: 0 }); lensRT.texture.colorSpace = THREE.SRGBColorSpace;
 const lensMat = new THREE.ShaderMaterial({
   uniforms: { t: { value: lensRT.texture }, k1: { value: LENS.k1 }, k2: { value: LENS.k2 } },
   vertexShader: 'varying vec2 vUv; void main(){ vUv = uv; gl_Position = vec4(position.xy, 0., 1.); }',
@@ -594,9 +594,20 @@ function updateHands() {
   if (performance.now() - lastDetect < 50) return; lastDetect = performance.now();
   let res; try { res = handLandmarker.detectForVideo(video, performance.now()); } catch (e) { camState = 'сбой распознавания: ' + (e.message || e); handLandmarker = null; return; }
   for (const h of hands) h.active = h.pinching = false;
-  const list = res.landmarks.map(l => ({ l, x: l[9].x })).sort((a, b) => a.x - b.x);   // тыловая камера не зеркалит: слева в кадре — левая рука
-  list.forEach(({ l }, i) => {
-    const h = list.length === 2 ? hands[1 - i] : hands[l[9].x < 0.5 ? 1 : 0];
+  /* Кто есть кто: рука держит «личность» по близости к прошлому положению в кадре (а не по x), иначе при пересечении рук лапы меняются местами */
+  const now = performance.now(), dets = res.landmarks.map(l => ({ l, x: l[9].x, y: l[9].y }));
+  const fresh = h => h.seen && now - h.seen < 700, dist = (h, d) => fresh(h) ? Math.hypot(h.ix - d.x, h.iy - d.y) : 0.3;
+  const pick = new Map();                                   // рука → детекция
+  if (dets.length >= 2) {
+    const [d0, d1] = dets;
+    const swap = hands.some(fresh) ? dist(hands[0], d1) + dist(hands[1], d0) < dist(hands[0], d0) + dist(hands[1], d1) : d0.x > d1.x;   // hands[0] — правая, при старте правее в кадре
+    pick.set(hands[0], swap ? d1 : d0); pick.set(hands[1], swap ? d0 : d1);
+  } else if (dets.length === 1) {
+    const d = dets[0];
+    pick.set(hands.some(fresh) ? (dist(hands[0], d) <= dist(hands[1], d) ? hands[0] : hands[1]) : (d.x < 0.5 ? hands[1] : hands[0]), d);
+  }
+  pick.forEach(({ l, x, y }, h) => {
+    h.ix = x; h.iy = y; h.seen = now;
     h.active = true;
     const palm = Math.hypot(l[0].x - l[9].x, l[0].y - l[9].y), pinchDist = Math.hypot(l[4].x - l[8].x, l[4].y - l[8].y) / palm;
     h.pinching = h.wasPinch ? pinchDist < 0.6 : pinchDist < 0.35; h.wasPinch = h.pinching;
