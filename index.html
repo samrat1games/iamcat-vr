@@ -38,6 +38,7 @@
 </div>
 <div id="rot"><i>📱</i>Поверни телефон горизонтально<br><small style="font-size:14px;opacity:.7">вставь его в Cardboard</small></div>
 <div id="ver" style="position:fixed;right:10px;bottom:6px;font-size:12px;opacity:.6;z-index:3;pointer-events:none">Cat VR · 0.1 alpha</div>
+<button id="perm" style="display:none;position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);z-index:15;font-size:20px;padding:16px 26px;border:0;border-radius:16px;background:#ffd36b;color:#2a1a10">Нажми — включить гироскоп и камеру</button>
 <div id="status"></div><div id="cross"></div>
 <video id="cam" playsinline muted></video>
 
@@ -113,9 +114,8 @@ function render(sc) {
   head.updateMatrixWorld(true);
   if (MODE === 'vr') {                                          // Stereo split-screen: левый и правый глаз
     const W = lensRT.width, H = lensRT.height, hw = W >> 1;
-    renderer.setRenderTarget(lensRT); lensRT.scissorTest = true;
-    renderer.shadowMap.needsUpdate = true;
-    for (const [cam, x0] of [[camL, 0], [camR, hw]]) { lensRT.viewport.set(x0, 0, hw, H); lensRT.scissor.set(x0, 0, hw, H); renderer.render(sc, cam); }
+    renderer.shadowMap.needsUpdate = true; lensRT.scissorTest = true;
+    for (const [cam, x0] of [[camL, 0], [camR, hw]]) { lensRT.viewport.set(x0, 0, hw, H); lensRT.scissor.set(x0, 0, hw, H); renderer.setRenderTarget(lensRT); renderer.render(sc, cam); }
     renderer.setRenderTarget(null); renderer.setScissorTest(false); renderer.setViewport(0, 0, w, h); renderer.render(lensScene, lensCam);
   } else { renderer.shadowMap.needsUpdate = true; renderer.setScissorTest(false); renderer.setViewport(0, 0, w, h); renderer.render(sc, camC); }
 }
@@ -151,16 +151,16 @@ function initSensor() {
       sensorRaw.set(q[0], q[1], q[2], q[3]);
       if (!sensorGot) { sensorGot = true; gyro.active = true; _e.setFromQuaternion(_sq.copy(_q1).multiply(sensorRaw), 'YXZ'); sensorYaw = -_e.y; }
     });
-    sn.addEventListener('error', () => { sensor = null; });
+    sn.addEventListener('error', ev => { sensor = null; gyro.sensorErr = ev.error && ev.error.name; });
     sn.start(); sensor = sn;
   } catch (e) { console.warn('sensor:', e.message || e); }
 }
 let gyroHooked = false;
 async function initGyro() {
-  if (DeviceOrientationEvent.requestPermission && await DeviceOrientationEvent.requestPermission() !== 'granted') throw new Error('гироскоп запрещён');
+  if (DeviceOrientationEvent.requestPermission && await DeviceOrientationEvent.requestPermission() !== 'granted') { gyro.denied = true; throw new Error('гироскоп запрещён'); }
   if (gyroHooked) return; gyroHooked = true; initSensor();
   addEventListener('deviceorientation', e => {
-    if (e.alpha == null) return;
+    if (e.alpha == null) { gyro.blocked = true; return; }
     if (!gyro.active) { gyro.active = true; gyro.yawOffset = -THREE.MathUtils.degToRad(e.alpha); }
     gyro.alpha = e.alpha; gyro.beta = e.beta; gyro.gamma = e.gamma;
   });
@@ -229,7 +229,17 @@ function enter(mode) {
   if (!IOS) sensors();                                             // Android — сразу; iOS требует тап (click)
   Promise.resolve().then(() => document.documentElement.requestFullscreen?.()).catch(() => {});
   screen.orientation?.lock?.('landscape').catch(() => {}); navigator.wakeLock?.request('screen').catch(() => {});
-  setInterval(() => { if (!gyro.active) status('Тапни экран — включить гироскоп и камеру'); else if ($('status').textContent.startsWith('Тапни')) status(''); }, 600);
+  const t0 = performance.now();
+  setInterval(() => {                                                // подсказки по платформе: iOS просит тап и разрешение, Android — только если датчик молчит
+    let msg = '';
+    if (!gyro.active) {
+      if (gyro.denied) msg = 'Датчики: доступ запрещён — удали иконку с экрана «Домой» и добавь заново (iOS: Настройки → Safari → Движение)';
+      else if (IOS) msg = '';                                          // кнопка «Разрешить» ниже
+      else if (performance.now() - t0 > 3000) msg = 'Датчики: нет данных гироскопа — в браузере: ⋮ → Настройки сайта → Датчики движения → Разрешить' + (gyro.sensorErr ? ' (' + gyro.sensorErr + ')' : '');
+    }
+    $('perm').style.display = IOS && !gyro.active ? 'block' : 'none';
+    if (msg) status(msg); else if ($('status').textContent.startsWith('Датчики')) status('');
+  }, 600);
   enterResolve();
 }
 function loadTick() {
