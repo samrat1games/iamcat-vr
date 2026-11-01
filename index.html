@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no, viewport-fit=cover">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<title>I am Cat VR</title>
+<title>Cat VR</title>
 <link rel="manifest" href="manifest.webmanifest">
 <meta name="theme-color" content="#2a1a10">
 <meta name="apple-mobile-web-app-capable" content="yes">
@@ -37,6 +37,7 @@
   </div>
 </div>
 <div id="rot"><i>📱</i>Поверни телефон горизонтально<br><small style="font-size:14px;opacity:.7">вставь его в Cardboard</small></div>
+<div id="ver" style="position:fixed;right:10px;bottom:6px;font-size:12px;opacity:.6;z-index:3;pointer-events:none">Cat VR · 0.1 alpha</div>
 <div id="status"></div><div id="cross"></div>
 <video id="cam" playsinline muted></video>
 
@@ -61,7 +62,7 @@ let loadProgress = 0;
 
 /* ---------- Renderer, камеры «головы» (общие для экрана загрузки и игры) ---------- */
 const renderer = new THREE.WebGLRenderer({ antialias: true });
-renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setPixelRatio(Math.min(devicePixelRatio, /Android/.test(navigator.userAgent) ? 1.5 : 2));
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 document.body.appendChild(renderer.domElement);
 
@@ -131,23 +132,38 @@ addEventListener('mousemove', e => {
 });
 
 const gyro = { alpha: 0, beta: 0, gamma: 0, active: false, yawOffset: 0 };
-const _q = new THREE.Quaternion(), _q1 = new THREE.Quaternion(-Math.sqrt(0.5), 0, 0, Math.sqrt(0.5)), _z = new THREE.Vector3(0, 0, 1);
+const _y = new THREE.Vector3(0, 1, 0), _q = new THREE.Quaternion(), _q1 = new THREE.Quaternion(-Math.sqrt(0.5), 0, 0, Math.sqrt(0.5)), _z = new THREE.Vector3(0, 0, 1);
 function applyGyro() {
   const d = THREE.MathUtils.degToRad, orient = d((screen.orientation && screen.orientation.angle) || window.orientation || 0);
   _e.set(d(gyro.beta), d(gyro.alpha) + gyro.yawOffset, -d(gyro.gamma), 'YXZ');
   head.quaternion.setFromEuler(_e).multiply(_q1).multiply(_q.setFromAxisAngle(_z, -orient));
 }
+/* RelativeOrientationSensor (Android/Chrome): готовый кватернион от гироскопа+акселерометра, заметно отзывчивее deviceorientation */
+const sensorRaw = new THREE.Quaternion(), _sq = new THREE.Quaternion(); let sensorGot = false, sensorYaw = 0, sensor = null;
+function initSensor() {
+  if (sensor || typeof RelativeOrientationSensor === 'undefined') return;
+  try {
+    const sn = new RelativeOrientationSensor({ frequency: 60, referenceFrame: 'screen' });
+    sn.addEventListener('reading', () => {
+      const q = sn.quaternion; if (!q) return;
+      sensorRaw.set(q[0], q[1], q[2], q[3]);
+      if (!sensorGot) { sensorGot = true; gyro.active = true; _e.setFromQuaternion(_sq.copy(_q1).multiply(sensorRaw), 'YXZ'); sensorYaw = -_e.y; }
+    });
+    sn.addEventListener('error', () => { sensor = null; });
+    sn.start(); sensor = sn;
+  } catch (e) { console.warn('sensor:', e.message || e); }
+}
 let gyroHooked = false;
 async function initGyro() {
   if (DeviceOrientationEvent.requestPermission && await DeviceOrientationEvent.requestPermission() !== 'granted') throw new Error('гироскоп запрещён');
-  if (gyroHooked) return; gyroHooked = true;
+  if (gyroHooked) return; gyroHooked = true; initSensor();
   addEventListener('deviceorientation', e => {
     if (e.alpha == null) return;
     if (!gyro.active) { gyro.active = true; gyro.yawOffset = -THREE.MathUtils.degToRad(e.alpha); }
     gyro.alpha = e.alpha; gyro.beta = e.beta; gyro.gamma = e.gamma;
   });
 }
-const updateLook = () => { if (MODE === 'pc') head.quaternion.setFromEuler(_e.set(pitch, yaw, 0, 'YXZ')); else if (gyro.active) applyGyro(); };
+const updateLook = () => { if (MODE === 'pc') head.quaternion.setFromEuler(_e.set(pitch, yaw, 0, 'YXZ')); else if (sensorGot) head.quaternion.setFromAxisAngle(_y, sensorYaw).multiply(_sq.copy(_q1).multiply(sensorRaw)); else if (gyro.active) applyGyro(); };
 
 /* ---------- Экран загрузки: логотип на весь экран + размытое «продолжение» вокруг, можно крутить головой ---------- */
 const loadScene = new THREE.Scene();
@@ -488,7 +504,7 @@ function moveHead(mx, mz) {                              // сдвиг с про
 }
 /* Как в Gorilla Tag: лапа упёрлась в пол/мебель — тело едет в обратную сторону от её движения (обе лапы усредняются);
    оторвал лапу — летишь по инерции с гравитацией, толчок вниз = прыжок; на земле трение, в воздухе почти нет */
-const ARM = { gain: 2.0, maxSpeed: 1.5, maxJump: 0, liftK: 0, gravity: 9.8, groundDrag: 7, airDrag: 0.3, touchR: 0.1, dead: 0.0015 };
+const ARM = { gain: 2.0, maxSpeed: 2.2, maxJump: 3.2, liftK: 0, hop: 0.5, slam: 1.0, gravity: 9.8, groundDrag: 7, airDrag: 0.3, touchR: 0.1, dead: 0.0015 };
 const armVel = new THREE.Vector3(), _aw = new THREE.Vector3(), _ad = new THREE.Vector3(), _as = new THREE.Vector3();
 let lift = 0, liftVel = 0, wasTouch = false;                 // высота над «нормальной» (стоячей) позой и вертикальная скорость
 function armLoco(dt) {
@@ -508,7 +524,7 @@ function armLoco(dt) {
     lift = Math.max(0, lift + _as.y * ARM.liftK); liftVel = 0;
     armVel.lerp(_as.divideScalar(dt), 0.5);
   } else {
-    if (wasTouch) { armVel.clampLength(0, ARM.maxSpeed); liftVel = THREE.MathUtils.clamp(armVel.y, 0, ARM.maxJump); }   // отрыв: запоминаем разгон
+    if (wasTouch) { armVel.clampLength(0, ARM.maxSpeed); liftVel = Math.max(THREE.MathUtils.clamp(armVel.y - ARM.slam, 0, ARM.maxJump), Math.hypot(armVel.x, armVel.z) * ARM.hop); }   // толчок вниз сильнее slam м/с — прыжок, иначе лёгкий подпрыг от скорости   // отрыв: запоминаем разгон
     armVel.y = 0;
     if (armVel.lengthSq() > 1e-4 && !moveHead(armVel.x * dt, armVel.z * dt)) armVel.multiplyScalar(0.3);
     armVel.multiplyScalar(Math.max(0, 1 - (lift > 0 ? ARM.airDrag : ARM.groundDrag) * dt));
@@ -535,10 +551,10 @@ function walk(dt) {
 
 // MediaPipe Hands (Cardboard)
 const video = $('cam');
-let handLandmarker = null, lastVideoTime = -1;
+let handLandmarker = null, lastVideoTime = -1, lastDetect = 0;
 async function initHands() {
   if (!navigator.mediaDevices?.getUserMedia) throw new Error('нет доступа к камере (нужен HTTPS)');
-  const streamP = navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' }, width: 640, height: 480 }, audio: false });   // сразу, пока жив тап
+  const streamP = navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' }, width: 480, height: 360, frameRate: 30 }, audio: false });   // сразу, пока жив тап
   const stream = await streamP; camState = 'грузим библиотеку рук…';
   const { HandLandmarker, FilesetResolver } = await import('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs');
   video.srcObject = stream; video.muted = true; video.setAttribute('playsinline', '');
@@ -570,6 +586,7 @@ function handOrient(l, h) {
 function updateHands() {
   if (!handLandmarker || video.currentTime === lastVideoTime) return;
   lastVideoTime = video.currentTime;
+  if (performance.now() - lastDetect < 30) return; lastDetect = performance.now();
   let res; try { res = handLandmarker.detectForVideo(video, performance.now()); } catch (e) { camState = 'сбой распознавания: ' + (e.message || e); handLandmarker = null; return; }
   for (const h of hands) h.active = h.pinching = false;
   const list = res.landmarks.map(l => ({ l, x: l[9].x })).sort((a, b) => a.x - b.x);   // тыловая камера не зеркалит: слева в кадре — левая рука
@@ -651,7 +668,7 @@ function tick() {
 window.__tick = tick; window.__dbg = { head, granny, hands, armLoco, moveHead, get lift() { return lift; }, world, scene, house, nav, reach, gs, dynamic, setView: (y, p) => { yaw = y; pitch = p; }, walkable: cellWalkable, hitStatic, groundAt, pickTarget, updateGranny };
 
 /* ---------- Конец загрузки → игра ---------- */
-loadProgress = 1; status('');
+loadProgress = 1; status(''); $('ver')?.remove();
 await entered;                                          // игрок мог ещё не выбрать режим — ждём
 await new Promise(r => setTimeout(r, params.has('test') ? 0 : 900));   // дать увидеть заполненную полоску
 {
