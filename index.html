@@ -668,7 +668,7 @@ function stepPhysics(dt) {
       }
     }
   } else if (!(heldBy.active && heldBy.pinching)) {           // отпустили: бросок со скоростью лапы
-    held.setBodyType(RAPIER.RigidBodyType.Dynamic, true); held.setCcdEnabled(true);
+    held.setBodyType(RAPIER.RigidBodyType.Dynamic, true); held.enableCcd(true);
     held.setLinvel(heldBy.pv.clampLength(0, 6), true);
     held = heldBy = null; status('');
   }
