@@ -5,11 +5,11 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no, viewport-fit=cover">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <title>Cat VR</title>
-<link rel="manifest" href="manifest.webmanifest">
+<link rel="manifest" href="manifest.webmanifest?v=2">
 <meta name="theme-color" content="#2a1a10">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="mobile-web-app-capable" content="yes">
-<link rel="apple-touch-icon" href="icon-192.png">
+<link rel="apple-touch-icon" href="icon-180.png?v=2">
 <style>
   html, body { margin: 0; height: 100%; overflow: hidden; background: #000; color: #fff; font: 16px system-ui, sans-serif; }
   canvas { display: block; touch-action: none; position: fixed; left: 0; top: 0; width: 100vw; height: 100vh; height: 100dvh; }
@@ -62,7 +62,8 @@ let loadProgress = 0;
 
 /* ---------- Renderer, камеры «головы» (общие для экрана загрузки и игры) ---------- */
 const renderer = new THREE.WebGLRenderer({ antialias: true });
-renderer.setPixelRatio(Math.min(devicePixelRatio, /Android/.test(navigator.userAgent) ? 1.5 : 2));
+renderer.setPixelRatio(Math.min(devicePixelRatio, /Android/.test(navigator.userAgent) ? 1 : 2));
+renderer.shadowMap.autoUpdate = false;                   // карту теней обновляем вручную раз в кадр, а не на каждый глаз
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 document.body.appendChild(renderer.domElement);
 
@@ -113,9 +114,10 @@ function render(sc) {
   if (MODE === 'vr') {                                          // Stereo split-screen: левый и правый глаз
     const W = lensRT.width, H = lensRT.height, hw = W >> 1;
     renderer.setRenderTarget(lensRT); lensRT.scissorTest = true;
+    renderer.shadowMap.needsUpdate = true;
     for (const [cam, x0] of [[camL, 0], [camR, hw]]) { lensRT.viewport.set(x0, 0, hw, H); lensRT.scissor.set(x0, 0, hw, H); renderer.render(sc, cam); }
     renderer.setRenderTarget(null); renderer.setScissorTest(false); renderer.setViewport(0, 0, w, h); renderer.render(lensScene, lensCam);
-  } else { renderer.setScissorTest(false); renderer.setViewport(0, 0, w, h); renderer.render(sc, camC); }
+  } else { renderer.shadowMap.needsUpdate = true; renderer.setScissorTest(false); renderer.setViewport(0, 0, w, h); renderer.render(sc, camC); }
 }
 
 /* ---------- Управление взглядом: мышь / стрелки / гироскоп (нужно и на экране загрузки) ---------- */
@@ -217,14 +219,14 @@ function sensors() {                                     // гироскоп п�
   const g = gyro.active || gyroBusy ? Promise.resolve() : (gyroBusy = true, initGyro().catch(e => console.warn('гироскоп:', e.message || e)).finally(() => { gyroBusy = false; }));
   if (!params.has('test')) g.finally(() => startCam());
 }
-addEventListener('pointerdown', () => { if (MODE === 'vr' && (!gyro.active || camState !== 'ok')) sensors(); });
+for (const ev of ['click', 'touchend']) addEventListener(ev, () => { if (MODE === 'vr' && (!gyro.active || camState !== 'ok')) sensors(); });
 let warns = '';
 function enter(mode) {
   MODE = mode; PHASE = 'load'; $('start').remove();
   head.position.set(0, 0, 0); head.quaternion.identity();
   renderer.setAnimationLoop(() => { if (PHASE === 'load') loadTick(); else tick(); });
   const warn = t => { console.warn(t); status(t); };
-  sensors();                                                       // Android — сразу; iOS требует тап (см. pointerdown)
+  if (!IOS) sensors();                                             // Android — сразу; iOS требует тап (click)
   Promise.resolve().then(() => document.documentElement.requestFullscreen?.()).catch(() => {});
   screen.orientation?.lock?.('landscape').catch(() => {}); navigator.wakeLock?.request('screen').catch(() => {});
   setInterval(() => { if (!gyro.active) status('Тапни экран — включить гироскоп и камеру'); else if ($('status').textContent.startsWith('Тапни')) status(''); }, 600);
@@ -504,7 +506,7 @@ function moveHead(mx, mz) {                              // сдвиг с про
 }
 /* Как в Gorilla Tag: лапа упёрлась в пол/мебель — тело едет в обратную сторону от её движения (обе лапы усредняются);
    оторвал лапу — летишь по инерции с гравитацией, толчок вниз = прыжок; на земле трение, в воздухе почти нет */
-const ARM = { gain: 2.0, maxSpeed: 2.2, maxJump: 3.2, liftK: 0, hop: 0.5, slam: 1.0, gravity: 9.8, groundDrag: 7, airDrag: 0.3, touchR: 0.1, dead: 0.0015 };
+const ARM = { gain: 2.6, maxSpeed: 3, maxJump: 3.4, hop: 0.45, slam: 0.8, jumpK: 1.1, gravity: 9.8, groundDrag: 6, airDrag: 0.25, touchR: 0.25, dead: 0.0012 };
 const armVel = new THREE.Vector3(), _aw = new THREE.Vector3(), _ad = new THREE.Vector3(), _as = new THREE.Vector3();
 let lift = 0, liftVel = 0, wasTouch = false;                 // высота над «нормальной» (стоячей) позой и вертикальная скорость
 function armLoco(dt) {
@@ -518,18 +520,21 @@ function armLoco(dt) {
     h.touch = heldBy !== h && (_aw.y - floorY < ARM.touchR || hitStatic(_aw.x, _aw.y, _aw.z, ARM.touchR));
     if (h.touch) { _as.add(_ad); n++; }
   }
-  if (n) {
+  if (n) {                                                    // лапа упёрлась: тело едет назад-от-лапы, толчок вниз = прыжок
     _as.multiplyScalar(-ARM.gain / n);
     if (!moveHead(_as.x, _as.z)) _as.x = _as.z = 0;
-    lift = Math.max(0, lift + _as.y * ARM.liftK); liftVel = 0;
-    armVel.lerp(_as.divideScalar(dt), 0.5);
+    const vy = _as.y / dt;
+    armVel.x += (_as.x / dt - armVel.x) * 0.5; armVel.z += (_as.z / dt - armVel.z) * 0.5;
+    if (vy > ARM.slam) { liftVel = Math.max(liftVel, Math.min(ARM.maxJump, (vy - ARM.slam) * ARM.jumpK + 0.8)); lift = Math.max(lift, 0.002); }
   } else {
-    if (wasTouch) { armVel.clampLength(0, ARM.maxSpeed); liftVel = Math.max(THREE.MathUtils.clamp(armVel.y - ARM.slam, 0, ARM.maxJump), Math.hypot(armVel.x, armVel.z) * ARM.hop); }   // толчок вниз сильнее slam м/с — прыжок, иначе лёгкий подпрыг от скорости   // отрыв: запоминаем разгон
-    armVel.y = 0;
+    if (wasTouch) {                                           // отрыв: разгон сохраняется, при ходьбе — лёгкий кошачий подпрыг
+      armVel.y = 0; armVel.clampLength(0, ARM.maxSpeed);
+      if (lift <= 0) { const hop = Math.hypot(armVel.x, armVel.z) * ARM.hop; if (hop > 0.15) { liftVel = Math.max(liftVel, hop); lift = 0.002; } }
+    }
     if (armVel.lengthSq() > 1e-4 && !moveHead(armVel.x * dt, armVel.z * dt)) armVel.multiplyScalar(0.3);
     armVel.multiplyScalar(Math.max(0, 1 - (lift > 0 ? ARM.airDrag : ARM.groundDrag) * dt));
-    if (lift > 0 || liftVel > 0) { liftVel -= ARM.gravity * dt; lift += liftVel * dt; if (lift <= 0) { lift = 0; liftVel = 0; } }
   }
+  if (lift > 0) { liftVel -= ARM.gravity * dt; lift += liftVel * dt; if (lift <= 0) { lift = 0; liftVel = 0; } }
   wasTouch = n > 0;
 }
 function walk(dt) {
@@ -586,7 +591,7 @@ function handOrient(l, h) {
 function updateHands() {
   if (!handLandmarker || video.currentTime === lastVideoTime) return;
   lastVideoTime = video.currentTime;
-  if (performance.now() - lastDetect < 30) return; lastDetect = performance.now();
+  if (performance.now() - lastDetect < 50) return; lastDetect = performance.now();
   let res; try { res = handLandmarker.detectForVideo(video, performance.now()); } catch (e) { camState = 'сбой распознавания: ' + (e.message || e); handLandmarker = null; return; }
   for (const h of hands) h.active = h.pinching = false;
   const list = res.landmarks.map(l => ({ l, x: l[9].x })).sort((a, b) => a.x - b.x);   // тыловая камера не зеркалит: слева в кадре — левая рука
@@ -595,7 +600,7 @@ function updateHands() {
     h.active = true;
     const palm = Math.hypot(l[0].x - l[9].x, l[0].y - l[9].y), pinchDist = Math.hypot(l[4].x - l[8].x, l[4].y - l[8].y) / palm;
     h.pinching = h.wasPinch ? pinchDist < 0.6 : pinchDist < 0.35; h.wasPinch = h.pinching;
-    landmarkToHead(l[9], palm, h.target); h.target.x *= 1.4; h.target.y *= 1.6;
+    landmarkToHead(l[9], palm, h.target); h.target.x *= 1.5; h.target.y = h.target.y * 1.8 - 0.15;
     handOrient(l, h);   // лапа достаёт дальше руки — чтобы дотянуться до пола
   });
   for (const h of hands) if (!h.active) h.wasPinch = false;
@@ -663,6 +668,7 @@ function tick() {
   updateLook();
   walk(dt); updateHands(); updatePaw(); armLoco(dt); updateGranny(dt); stepPhysics(dt);
   sun.position.set(head.position.x + 2.5, head.position.y + 5, head.position.z + 3); sun.target.position.copy(head.position);
+  updateLook();                                                   // поздняя фиксация взгляда: берём самое свежее положение головы прямо перед отрисовкой
   render(scene);
 }
 window.__tick = tick; window.__dbg = { head, granny, hands, armLoco, moveHead, get lift() { return lift; }, world, scene, house, nav, reach, gs, dynamic, setView: (y, p) => { yaw = y; pitch = p; }, walkable: cellWalkable, hitStatic, groundAt, pickTarget, updateGranny };
